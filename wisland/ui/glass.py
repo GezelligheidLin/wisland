@@ -96,12 +96,15 @@ def grab_tiny(px: int, py: int, pw: int, ph: int, tw: int, th: int) -> QtGui.QIm
 class Backdrop(QtCore.QObject):
     """后台截取 + 模糊。主线程调用 request() 告知要覆盖的区域，结果通过 ready 信号回到主线程。"""
     ready = QtCore.Signal(bool)          # changed
+    _captured = QtCore.Signal(object, bool)
 
     def __init__(self):
         super().__init__()
         # (模糊小图, 对应的全局逻辑区域, 亮度)；整体替换，主线程读到的总是一致的一组
         self.state: tuple = (None, QtCore.QRect(), 0.5)
         self._sig = None
+        self._capture_rect = QtCore.QRect()
+        self._captured.connect(self._publish)
         self._lock = threading.Lock()
         self._want: tuple | None = None     # (逻辑区域, 物理区域)
         self._interval = 0.1
@@ -195,10 +198,39 @@ class Backdrop(QtCore.QObject):
         sig = bytes(img.scaled(8, 4, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio, mode).constBits())
         c = img.scaled(1, 1, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio, mode).pixelColor(0, 0)
         lum = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
-        changed = sig != self._sig or r != self.rect
+        changed = sig != self._sig or r != self._capture_rect
         self._sig = sig
-        self.state = (img, QtCore.QRect(r), lum)
+        self._capture_rect = QtCore.QRect(r)
+        self._captured.emit((img, QtCore.QRect(r), lum), changed)
+
+    @QtCore.Slot(object, bool)
+    def _publish(self, state, changed: bool):
+        """在 UI 线程发布整帧，让亮度判断和绘制始终使用同一张截图。"""
+        self.state = state
         self.ready.emit(changed)
+
+    @staticmethod
+    def blend_states(source, target, progress: float):
+        """冻结当前可见的混合背景，供被新截图打断的渐变连续接续。"""
+        if not source or source[0] is None or progress >= 1:
+            return target
+        if not target or target[0] is None or progress <= 0:
+            return source
+        rect = source[1].united(target[1])
+        width = max(2, (rect.width() + DOWN - 1) // DOWN)
+        height = max(2, (rect.height() + DOWN - 1) // DOWN)
+        image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        painter.scale(width / rect.width(), height / rect.height())
+        painter.translate(-rect.x(), -rect.y())
+        origin = QtCore.QPoint()
+        painter.fillRect(rect, Backdrop.brush_for(source, origin))
+        painter.setOpacity(progress)
+        painter.fillRect(rect, Backdrop.brush_for(target, origin))
+        painter.end()
+        return image, rect, source[2] + (target[2] - source[2]) * progress
 
     def covers(self, grect: QtCore.QRect) -> bool:
         tiny, rect, _ = self.state

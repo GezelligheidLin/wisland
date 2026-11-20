@@ -47,6 +47,7 @@ class G:
     GEAR = "\uE713"
     IMAGE = "\uE91B"
     CHECK = "\uE73E"
+    TODO = "\uE73A"
     BELL = "\uEA8F"
     CHAT = "\uE8F2"
     MUSIC = "\uE8D6"
@@ -124,6 +125,9 @@ PALETTES = {
 THEME_NAMES = [("auto", "跟随背景自动"), ("light", "浅色毛玻璃"), ("dark", "深色毛玻璃"),
                ("rouge", "胭脂撞色"), ("sky", "晴空渐变")]
 
+THEME_TRANSITION_MS = 260
+THEME_EASING = QtCore.QEasingCurve(QtCore.QEasingCurve.Type.InOutCubic)
+
 
 class Theme(QtCore.QObject):
     changed = QtCore.Signal()
@@ -133,12 +137,21 @@ class Theme(QtCore.QObject):
         self.mode = mode
         self._lum = 0.5
         self.pal_name = None
+        self._colors: dict[str, QtGui.QColor] = {}
+        self._color_from: dict[str, QtGui.QColor] = {}
+        self._color_to: dict[str, QtGui.QColor] = {}
+        self._transition = QtCore.QVariantAnimation(self)
+        self._transition.setDuration(THEME_TRANSITION_MS)
+        self._transition.setStartValue(0.0)
+        self._transition.setEndValue(1.0)
+        self._transition.setEasingCurve(THEME_EASING)
+        self._transition.valueChanged.connect(self._animate_colors)
         self._apply(mode if mode in PALETTES else "dark")
 
     # --- 自动切换（带滞回，避免在中间亮度来回跳） ---
     def feed_luminance(self, lum: float):
-        import time as _t
-        self._lum = self._lum * 0.8 + lum * 0.2
+        """同一帧背景采样直接决定主题，用明暗阈值滞回防抖，避免二次渐变。"""
+        self._lum = max(0.0, min(1.0, lum))
         if self.mode != "auto":
             return
         elif self.dark and self._lum > 0.64:
@@ -148,17 +161,7 @@ class Theme(QtCore.QObject):
         else:
             want = self.dark
         if want == self.dark:
-            self._flip_since = None
             return
-        now = _t.monotonic()
-        if self.mode == "auto":
-            # 身后画面要持续越过阈值 3 秒才切换，滚动的网页之类不会让玻璃来回闪
-            if getattr(self, "_flip_since", None) is None:
-                self._flip_since = now
-                return
-            if now - self._flip_since < 3.0:
-                return
-        self._flip_since = None
         self._apply("dark" if want else "light")
 
     def set_mode(self, mode: str):
@@ -167,16 +170,44 @@ class Theme(QtCore.QObject):
         self._apply(pal)
 
     def _apply(self, pal: str):
-        changed = pal != getattr(self, "pal_name", None)
+        """从当前显示颜色过渡到目标色板，连续换主题时不回跳到旧色板。"""
+        if pal == self.pal_name:
+            return
+        initial = self.pal_name is None
+        self._transition.stop()
         self.pal_name = pal
         self.pal = PALETTES[pal]
         self.dark = self.pal["dark"]
-        if changed:
+        colors = {key: QtGui.QColor(*value) if isinstance(value, tuple) else QtGui.QColor(value)
+                  for key, value in self.pal.items() if key not in ("dark", "t2", "t3", "menu")}
+        colors["tint2"] = QtGui.QColor(colors.get("tint2", colors["tint"]))
+        colors["pill_fg"] = QtGui.QColor(colors.get("pill_fg", colors["text"]))
+        colors["on_fg"] = QtGui.QColor(colors.get("on_fg", QtGui.QColor("white")))
+        colors["glass_gloss"] = QtGui.QColor(255, 255, 255, 14 if self.dark else 26)
+        colors["edge_glow"] = QtGui.QColor(255, 255, 255, 55 if self.dark else 80)
+        for key, factor in (("_text2", self.pal["t2"]), ("_text3", self.pal["t3"])):
+            colors[key] = QtGui.QColor(colors["text"])
+            colors[key].setAlphaF(colors[key].alphaF() * factor)
+        if initial:
+            self._colors = colors
             self.changed.emit()
+            return
+        self._color_from = {key: QtGui.QColor(value) for key, value in self._colors.items()}
+        self._color_to = colors
+        self._transition.start()
+
+    def _animate_colors(self, value):
+        """逐帧混合颜色与透明度，通知面板和子控件同步重绘。"""
+        progress = float(value)
+        for key, target in self._color_to.items():
+            source = self._color_from[key]
+            channels = [a + (b - a) * progress for a, b in zip(source.getRgbF(), target.getRgbF())]
+            self._colors[key] = QtGui.QColor.fromRgbF(*channels)
+        self.changed.emit()
 
     # --- 颜色（按当前主题的色板） ---
     def _c(self, key: str, a: float = 1.0) -> QtGui.QColor:
-        c = QtGui.QColor(*self.pal[key]) if isinstance(self.pal[key], tuple) else QtGui.QColor(self.pal[key])
+        c = QtGui.QColor(self._colors[key])
         c.setAlphaF(max(0.0, min(1.0, c.alphaF() * a)))
         return c
 
@@ -184,22 +215,28 @@ class Theme(QtCore.QObject):
         return self._c("text", a)
 
     def text2(self, a: float = 1.0) -> QtGui.QColor:
-        return self._c("text", self.pal["t2"] * a)
+        return self._c("_text2", a)
 
     def text3(self, a: float = 1.0) -> QtGui.QColor:
-        return self._c("text", self.pal["t3"] * a)
+        return self._c("_text3", a)
 
     def tint(self) -> QtGui.QColor:
         return self._c("tint")
 
+    def glass_gloss(self) -> QtGui.QColor:
+        return self._c("glass_gloss")
+
+    def edge_glow(self) -> QtGui.QColor:
+        return self._c("edge_glow")
+
     def tint_brush(self, rect: QtCore.QRectF) -> QtGui.QBrush:
         """玻璃色调：渐变主题用纵向渐变，其余为纯色。"""
-        g2 = self.pal.get("tint2")
-        if not g2:
+        g2 = self._c("tint2")
+        if g2 == self.tint():
             return QtGui.QBrush(self.tint())
         g = QtGui.QLinearGradient(rect.left(), rect.top(), rect.right() * 0.25 + rect.left() * 0.75, rect.bottom())
         g.setColorAt(0, self._c("tint"))
-        g.setColorAt(1, QtGui.QColor(*g2))
+        g.setColorAt(1, g2)
         return QtGui.QBrush(g)
 
     def card(self, a: float = 1.0) -> QtGui.QColor:
@@ -214,12 +251,7 @@ class Theme(QtCore.QObject):
 
     def pill_text(self, a: float = 1.0) -> QtGui.QColor:
         """当前项（亮色底块）上的文字颜色。"""
-        fg = self.pal.get("pill_fg")
-        if not fg:
-            return self.text(a)
-        c = QtGui.QColor(fg)
-        c.setAlphaF(max(0.0, min(1.0, a)))
-        return c
+        return self._c("pill_fg", a)
 
     def track(self) -> QtGui.QColor:
         return self._c("track")
@@ -236,9 +268,7 @@ class Theme(QtCore.QObject):
         return self._c("on")
 
     def on_fg(self, a: float = 1.0) -> QtGui.QColor:
-        c = QtGui.QColor(self.pal.get("on_fg", "#ffffff"))
-        c.setAlphaF(a)
-        return c
+        return self._c("on_fg", a)
 
     def up(self) -> QtGui.QColor:       # A 股习惯：红涨
         return self._c("up")
@@ -265,6 +295,7 @@ class Theme(QtCore.QObject):
 KIND_COLORS = {
     "qq": QtGui.QColor("#12b7f5"),
     "wechat": QtGui.QColor("#07c160"),
+    "dingtalk": QtGui.QColor("#0089ff"),
     "mail": QtGui.QColor("#ff9f0a"),
     "stock": QtGui.QColor("#ff5a52"),
     "other": QtGui.QColor("#8e8e93"),
