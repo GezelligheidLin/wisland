@@ -7,6 +7,21 @@ import traceback
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
+def _sanitize_proxy_env():
+    """httpx 0.28 把 NO_PROXY 按 URL 解析，Windows 常写入 [::1] 这类带括号的 IPv6，
+    会被当作非法端口，导致新建 httpx.Client 时直接抛 InvalidURL。"""
+    for name in ("NO_PROXY", "no_proxy"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        parts = [part for part in raw.split(",") if "[" not in part and "]" not in part]
+        if len(parts) != len(raw.split(",")):
+            os.environ[name] = ",".join(parts) or "localhost,127.0.0.1"
+
+
+_sanitize_proxy_env()
+
+
 def _relaunch_windowless():
     """uv 创建的 .venv 里 Scripts\\pythonw.exe 其实是控制台程序，直接用它启动（例如旧的开机自启项、
     电脑管家恢复的启动项）会弹出终端窗口，关掉窗口灵动岛也会退出。
