@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import os
 import time
 from ctypes import wintypes
 
@@ -27,6 +28,8 @@ from .glass import Backdrop, exclude_from_capture
 from .nav import NavBar
 from .shape import body_path, body_points, deform, drip_path, edge_corners, neck_path, poly_path
 from .theme import G, theme
+
+_DBG = bool(os.environ.get("WISLAND_DEBUG"))
 
 Qt = QtCore.Qt
 user32 = ctypes.WinDLL("user32")
@@ -377,11 +380,19 @@ class Island(QtWidgets.QWidget):
             self.show_page(page)
         if not self.expanded:
             self.expanded = True
+            # 重置“地板”状态：否则收起后残留的 floor_on 会在再次展开到相同尺寸时
+            # 把弹簧直接 snap 到目标，导致只有首次展开有动画
+            self._floor_t.clear()
+            self._floor_on.clear()
             self.compact_a.to(0, 900, 1.0)
             self.poke.snap(0.0)                       # 展开时清掉按压形变
             w, h = self.target_size()
+            # 利落展开 ~0.2s；配合 expand 起始的地板重置，保证每次展开都有动画
             self.sw.to(w, 420, 0.62)
             self.sh.to(h, 420, 0.62)
+            if _DBG:
+                print(f"[expand] start sw.x={self.sw.x:.1f} sh.x={self.sh.x:.1f} "
+                      f"target=({w:.1f},{h:.1f}) floor_on={dict(self._floor_on)} floor_t={dict(self._floor_t)}")
             self.content_a.snap(0)
             tw, th = self.target_size()
             self.content.setGeometry(self._content_rect(tw, th))   # 先隐藏，形状长大后再显示
@@ -607,6 +618,9 @@ class Island(QtWidgets.QWidget):
                 if sp.x >= sp.target:
                     self._floor_on[key] = True
                 elif self._floor_on.get(key):
+                    if _DBG:
+                        print(f"[tick] FLOOR SNAP {key}: x={sp.x:.1f} -> target={sp.target:.1f} "
+                              f"(floor_on={self._floor_on.get(key)}, floor_t={self._floor_t.get(key)})")
                     sp.x, sp.v = sp.target, 0.0
         for d in self.drips:
             d["r"].step(dt)
