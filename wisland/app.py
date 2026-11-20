@@ -78,7 +78,9 @@ def autostart_enabled() -> bool:
 
 
 def _autostart_cmd() -> str:
-    """开机自启命令：通过 wisland.vbs 启动（它会选用不带控制台的 pythonw，不会弹出终端窗口）。"""
+    """开机自启命令：打包版直接启动 exe；源码版通过 wisland.vbs 选用不带控制台的 pythonw。"""
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}"'
     wscript = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wscript.exe")
     return f'"{wscript}" "{ROOT / "wisland.vbs"}"'
 

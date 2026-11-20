@@ -6,10 +6,20 @@
 
 ## 安装
 
+### 免安装版（推荐）
+
+在右侧 **Releases** 下载最新版本：
+
+- **`wisland-x.y.z.zip`**：解压后双击 `Wisland.exe` 即可运行。配置、缓存和模型都保存在同一个文件夹里，整个文件夹可以随意移动。
+- **`Wisland-x.y.z.exe`**：单文件版，双击即可运行（每次启动要先解压，会比目录版慢几秒）。
+
+不需要安装 Python。开机自启：右键灵动岛 → **设置 → 常规 → 开机自启**。
+
+### 从源码运行
+
 1. 安装 **Python 3.10 或更新版本**：<https://www.python.org/downloads/windows/>
    （安装时勾选 **Add python.exe to PATH**）
-2. 下载本项目：右侧 **Releases** 里下载 `wisland-x.y.z.zip` 并解压
-   （或 `git clone https://github.com/AsamiAkito/wisland.git`）。
+2. 下载本项目源码（或 `git clone https://github.com/GezelligheidLin/wisland.git`），
    路径里最好不要有特殊字符。
 3. 双击 **`setup.bat`**：自动创建 `.venv`、补齐 pip、安装依赖（PyPI 连不上时自动改用清华镜像），需要几分钟。
 4. 双击 **`wisland.vbs`** 启动。还没运行过 `setup.bat` 时，它会提示并帮你运行。

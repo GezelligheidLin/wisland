@@ -1,0 +1,101 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（如 1.2.0；留空则使用 0.0.<运行序号>）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.10,<7"
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          } elseif ("${{ inputs.version }}" -ne "") {
+            $version = "${{ inputs.version }}".TrimStart("v")
+          } else {
+            $version = "0.0.${{ github.run_number }}"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build (onedir + onefile)
+        run: pyinstaller --noconfirm --clean packaging/wisland.spec
+
+      - name: Smoke test
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $p = Start-Process -FilePath "dist\Wisland\Wisland.exe" -ArgumentList "--self-check" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path "dist\Wisland\data\selfcheck.txt") { Get-Content "dist\Wisland\data\selfcheck.txt" }
+            throw "onedir 冒烟检查失败（exit $($p.ExitCode)）"
+          }
+          $p = Start-Process -FilePath "dist\Wisland-onefile.exe" -ArgumentList "--self-check" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path "dist\data\selfcheck.txt") { Get-Content "dist\data\selfcheck.txt" }
+            throw "onefile 冒烟检查失败（exit $($p.ExitCode)）"
+          }
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          Copy-Item README.md, LICENSE dist/Wisland/
+          Rename-Item "dist\Wisland-onefile.exe" "Wisland-$v.exe"
+          Push-Location dist/Wisland
+          7z a -tzip -mx=5 "../wisland-$v.zip" *
+          Pop-Location
+          Get-ChildItem dist -File | Select-Object Name, @{n="MB"; e={[math]::Round($_.Length / 1MB, 1)}}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wisland-${{ steps.ver.outputs.version }}
+          path: |
+            dist/wisland-*.zip
+            dist/Wisland-*.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Wisland ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/wisland-*.zip
+            dist/Wisland-*.exe

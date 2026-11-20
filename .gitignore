@@ -17,3 +17,7 @@ models/
 
 # 宣传视频素材与输出
 promo/
+
+# PyInstaller 构建产物
+build/
+dist/
