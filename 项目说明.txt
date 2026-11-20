@@ -1,0 +1,43 @@
+项目名称：Wisland（Windows 液态灵动岛）
+项目目录：D:\work\dev\Miao\wisland（仓库直接位于当前工作区，经用户确认不采用 <拼音名>/code/base 默认布局）
+
+origin：git@github.com:GezelligheidLin/wisland.git（用户自己的仓库，推送目标）
+upstream：https://github.com/AsamiAkito/wisland.git（上游公共仓库）
+当前开发分支：main（HEAD ab04dba，含展开地板修复提交）
+拉取跟踪：origin/main
+默认推送：origin（remote.pushDefault=origin）；已快进推送 ab04dba 到 origin/main。
+仓库源码有经用户确认的调整（已提交 ab04dba 并推送 origin），均在 ui/island.py：
+1) 修复上游 bug：展开“地板”状态(_floor_t/_floor_on)收起后不清零，导致再次展开到相同尺寸时
+   弹簧被直接 snap 到目标（只有首次展开有动画）。现在每次 expand 起始重置地板状态。
+2) 展开手感定为约 0.2s（弹簧刚度 420、阻尼比 0.62，即上游原速），配合修复后每次展开都有动画。
+3) 新增 WISLAND_DEBUG 环境变量开关的调试日志（[expand]/[tick] FLOOR SNAP），默认关闭不影响运行。
+其余源码未改动。
+
+技术栈：Python 3.10+ / PySide6，入口 run.pyw。本次构建版本记为 1.2.2。
+
+构建环境（不改系统 PATH / 不装系统级 Python）：
+- uv 0.13.0 管理的独立 CPython 3.12.15 + 仓库内 .venv
+- 依赖见 requirements.txt；打包工具 PyInstaller 6.22.3（onedir、无控制台 windowed）
+- 安装包编译器 Inno Setup 6.7.4，per-user 安装于 D:\work\env\inno-setup（ISCC.exe）
+  安装器缓存 D:\work\env\installers\inno-setup\6.7.4\（Authenticode Valid，Pyrsys B.V.）
+
+构建脚本（均在仓库外 D:\work\dev\Miao\wisland-build\）：
+- wisland.spec / wisland_entry.py / rthook_wisland.py（PyInstaller）
+- wisland.iss（Inno Setup）/ make_zip.py（便携 zip）
+
+产物（D:\work\dev\Miao\wisland-dist\）：
+- wisland-setup-1.2.2.exe        约 78 MB  Inno Setup 安装包（per-user，装到 %LOCALAPPDATA%\Programs\wisland，无需管理员）
+- wisland-1.2.2-portable.zip     约 117 MB 免安装包（解压即用，目标机无需 Python）
+- wisland\                       约 426 MB 已解包的 onedir 程序（wisland.exe + _internal + wisland.vbs）
+
+便携布局与兼容处理：
+- 运行时钩子把 ROOT 重定向到 exe 所在目录，config.json / data / models 均落在 exe 旁，持久保存。
+- 兼容处理：httpx 0.28.1 解析 NO_PROXY 中带方括号的 IPv6（如 [::1]）会抛 InvalidURL 导致启动崩溃；
+  钩子在进程内将 NO_PROXY 的方括号去除（[::1]→::1，保留回环排除语义）。仅影响本进程，不改用户持久环境变量，不改仓库源码。
+- 随包提供 wisland.vbs（启动 wisland.exe），使应用自带“开机自启”菜单在打包后仍可用。
+- 实时字幕识别模型（约 630 MB）不随包，首次点“开始聆听”时按原逻辑下载。
+
+验证：冻结 exe 已做启动冒烟测试（正常环境下运行后终止，日志无报错）；zip 完整性校验通过；安装器为合法 Inno Setup 编译产物。
+按用户要求：只编译安装包，未执行安装、未运行安装器。
+
+初始化/构建日期：2026-11-19
