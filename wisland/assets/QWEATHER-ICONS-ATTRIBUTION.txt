@@ -1,0 +1,3 @@
+Weather icons: QWeather Icons (https://icons.qweather.com/)
+Copyright QWeather. Icon artwork is licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).
+The font and code-point map are bundled locally from the official QWeather Icons distribution.

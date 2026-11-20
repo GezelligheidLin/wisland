@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""股票（腾讯财经公开行情）与天气（Open-Meteo / OpenWeather）。"""
+"""股票（腾讯财经公开行情）与天气（UAPIs 数据，QWeather Icons 图标）。"""
 from __future__ import annotations
 
 import datetime as dt
@@ -345,20 +345,26 @@ class Daily(QtWidgets.QWidget, Themed):
                 name = str(d)
             p.setFont(ui_font(12.5, W.Medium))
             p.setPen(theme.text())
-            p.drawText(QtCore.QRectF(0, y, 44, rh), Qt.AlignmentFlag.AlignVCenter, name)
+            p.drawText(QtCore.QRectF(0, y, 40, rh), Qt.AlignmentFlag.AlignVCenter, name)
             g, fam = weather_glyph(it.get("icon"))
             f = QtGui.QFont()
             f.setFamilies([fam, "Segoe Fluent Icons", "Segoe UI Symbol"])
             f.setPixelSize(16)
             p.setFont(f)
-            p.drawText(QtCore.QRectF(44, y, 26, rh), Qt.AlignmentFlag.AlignCenter, g)
+            p.drawText(QtCore.QRectF(40, y, 24, rh), Qt.AlignmentFlag.AlignCenter, g)
+            if it.get("text"):
+                p.setFont(ui_font(11.5))
+                p.setPen(theme.text2())
+                fm = QtGui.QFontMetrics(p.font())
+                text = fm.elidedText(str(it["text"]), Qt.TextElideMode.ElideRight, 48)
+                p.drawText(QtCore.QRectF(64, y, 48, rh), Qt.AlignmentFlag.AlignVCenter, text)
             p.setFont(ui_font(12, num=True))
             p.setPen(theme.text2())
-            p.drawText(QtCore.QRectF(74, y, 30, rh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, f"{round(it['min'])}°")
+            p.drawText(QtCore.QRectF(114, y, 32, rh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, f"{round(it['min'])}°")
             p.setPen(theme.text())
-            p.drawText(QtCore.QRectF(self.width() - 32, y, 32, rh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+            p.drawText(QtCore.QRectF(self.width() - 36, y, 32, rh), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        f"{round(it['max'])}°")
-            bx, bw = 112, self.width() - 112 - 40
+            bx, bw = 152, self.width() - 152 - 44
             span = max(1e-6, hi - lo)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(theme.track())
@@ -431,7 +437,13 @@ class CityChip(Hoverable):
 def _fmt_clock(ts, tz_off):
     if not ts:
         return "--"
-    return dt.datetime.fromtimestamp(int(ts) + int(tz_off or 0), dt.timezone.utc).strftime("%H:%M")
+    if isinstance(ts, str):
+        # Older cached entries stored the city's clock time directly.
+        return ts.strip()[:5] if ":" in ts else "--"
+    try:
+        return dt.datetime.fromtimestamp(int(ts) + int(tz_off or 0), dt.timezone.utc).strftime("%H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "--"
 
 
 def _wind_dir(deg):
@@ -440,14 +452,56 @@ def _wind_dir(deg):
     return ["北", "东北", "东", "东南", "南", "西南", "西", "西北"][int(((deg + 22.5) % 360) // 45)] + "风"
 
 
+_AQI_COLORS = {1: "#34c759", 2: "#f5c518", 3: "#ff9f0a", 4: "#ff453a", 5: "#bf5af2", 6: "#a33b3b"}
+
+
+def _aqi_color(value, level) -> QtGui.QColor | None:
+    try:
+        grade = int(level)
+    except (TypeError, ValueError):
+        grade = 0
+    if grade not in _AQI_COLORS:
+        try:
+            grade = 1 if value <= 50 else 2 if value <= 100 else 3 if value <= 150 else 4 if value <= 200 else 5 if value <= 300 else 6
+        except TypeError:
+            return None
+    color = _AQI_COLORS.get(grade)
+    return QtGui.QColor(color) if color else None
+
+
+def _clock_text(value) -> str:
+    """把接口时间（2026-11-20 16:50:00 或 ISO）压缩成 HH:MM。"""
+    text = str(value or "").strip().replace("T", " ")
+    if not text:
+        return ""
+    chunk = text.split()[-1] if " " in text else text
+    return chunk[:5] if ":" in chunk else ""
+
+
+def _air_text(d: dict) -> str:
+    parts = []
+    primary = d.get("aqi_primary")
+    if primary:
+        parts.append(f"首要 {primary}")
+    labels = (("pm25", "PM2.5"), ("pm10", "PM10"), ("o3", "O₃"), ("no2", "NO₂"), ("so2", "SO₂"), ("co", "CO"))
+    for key, label in labels:
+        value = (d.get("air") or {}).get(key)
+        if value is None:
+            continue
+        parts.append(f"{label} {value:.0f}" if key != "co" else f"CO {value:g}")
+    return " · ".join(parts)
+
+
 class WeatherPage(Page):
-    key, glyph, title, height = "weather", G.CLOUD, "天气", 318
+    key, glyph, title, height = "weather", G.CLOUD, "天气", 425
 
     def __init__(self, ctx):
         super().__init__(ctx)
         self.sel = 0
         self.data: list[dict] = []
         self.chips: list[CityChip] = []
+        self._editing = None
+        self._pending_sel = None
         # 顶部：城市胶囊 + 添加
         self.chip_row = QtWidgets.QHBoxLayout()
         self.chip_row.setSpacing(4)
@@ -461,7 +515,7 @@ class WeatherPage(Page):
         self.add_edit.focus_wanted.connect(self.want_focus)
         self.add_edit.returnPressed.connect(self._do_add)
         self.add_edit.installEventFilter(self)
-        refresh = IconButton(G.REFRESH, 28, 12, "刷新")
+        refresh = IconButton(G.REFRESH, 28, 12, "重新加载缓存；天气每天最多查询一次")
         refresh.clicked.connect(lambda: ctx.weather.refresh())
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(6)
@@ -480,13 +534,27 @@ class WeatherPage(Page):
         self.temp.setFixedHeight(56)
         self.desc = Label("", 14, W.Medium)
         self.city = Label("", 12, level=2)
+        self.stamp = Label("", 10.5, level=3)
         self.hourly = Hourly()
         self.daily = Daily()
-        self.daily.setFixedWidth(250)
+        self.daily.setFixedWidth(290)
         self.facts = Facts()
-        left = vbox(hbox(self.icon, self.temp, None, spacing=6), self.desc, self.city, None, spacing=2)
+        self.alert = Label("", 11, color=QtGui.QColor("#ff9f0a"))
+        self.alert.hide()
+        self.pollutants = Label("", 10.5, level=3)
+        self.pollutants.hide()
+        self.life_title = Label("生活指数", 11, level=3)
+        self.life_title.hide()
+        self.life = LifeGrid()
+        self.life.hide()
+        self.hero = QtWidgets.QWidget()
+        self.hero.setLayout(vbox(hbox(self.icon, self.temp, None, spacing=6),
+                                 self.desc, self.city, self.stamp, spacing=2))
+        self._hero_h = self.hero.sizeHint().height()
+        self.daily.setFixedHeight(self._hero_h)
         self.body = QtWidgets.QWidget()
-        self.body.setLayout(vbox(hbox((left, 1), self.daily, spacing=16), self.facts, self.hourly, spacing=6))
+        self.body.setLayout(vbox(hbox((self.hero, 1), self.daily, spacing=16), self.facts, self.alert,
+                                 self.pollutants, self.hourly, self.life_title, self.life, spacing=6))
         self.err = Label("", 13, level=2, align=Qt.AlignmentFlag.AlignCenter, wrap=True)
         self.err.hide()
         self.setLayout(vbox(head, (self.body, 1), self.err, spacing=8))
@@ -517,6 +585,7 @@ class WeatherPage(Page):
                 self.chips.append(c)
         for c, d in zip(self.chips, data):
             c.default = c.idx == 0
+            c.setToolTip(("默认城市 · " if c.default else "") + "右键：修改 / 设为默认 / 删除")
             c.set_info(f"{round(d['temp'])}°" if d.get("temp") is not None else "--°", weather_glyph(d.get("icon")))
         self.sel = min(self.sel, max(0, len(data) - 1))
         self.select(self.sel)
@@ -536,6 +605,8 @@ class WeatherPage(Page):
             self.err.setText(d.get("error") or "暂无数据")
             self.err.show()
             self.body.hide()
+            if self.height != 300:
+                self.set_height(300)
             return
         self.err.hide()
         self.body.show()
@@ -545,28 +616,116 @@ class WeatherPage(Page):
         self.desc.setText(d.get("desc", ""))
         lo, hi = d.get("temp_min"), d.get("temp_max")
         rng = f"   最低 {round(lo)}° 最高 {round(hi)}°" if lo is not None and hi is not None else ""
-        self.city.setText(f"{d.get('name', '')}{rng}")
+        place = d.get("name") or d.get("city") or ""
+        district = d.get("district")
+        stem = str(district or "").rstrip("区县市")
+        if district and stem and district not in place and stem not in place:
+            place += f" · {district}"
+        self.city.setText(f"{place}{rng}")
         tz = d.get("tz_offset", 0)
         vis = d.get("visibility")
+        feels_like = d.get("feels_like")
+        wind = d.get("wind_direction") or ""
+        if d.get("wind"):
+            wind = f"{wind} {d['wind']}".strip()
+        elif d.get("wind_speed") is not None:
+            wind = f"{wind} {d['wind_speed']:.0f}km/h".strip()
+        humidity = d.get("humidity")
+        pressure = d.get("pressure")
+        uv = d.get("uv")
+        today = (d.get("daily") or [{}])[0]
+        if isinstance(today, dict) and today.get("uv") is not None:
+            uv = today["uv"]
+        uv_level = next((item.get("level") for item in (d.get("life_indices") or [])
+                         if item.get("key") == "uv"), "")
+        if uv is not None and uv_level:
+            uv_text = f"{uv:g} {uv_level}"
+        elif uv is not None:
+            uv_text = f"{uv:g}"
+        else:
+            uv_text = uv_level or "--"
+        aqi = d.get("aqi")
+        aqi_text = "--"
+        if aqi is not None:
+            aqi_text = f"{round(aqi)} {d.get('aqi_category') or ''}".strip()
+        precipitation = d.get("precipitation")
         self.facts.set_items([
-            ("体感", f"{round(d.get('feels_like', 0))}°"),
-            ("湿度", f"{d.get('humidity', '--')}%"),
-            ("风", f"{_wind_dir(d.get('wind_deg'))} {d.get('wind', '--')}m/s"),
-            ("气压", f"{d.get('pressure', '--')}hPa"),
-            ("能见度", f"{vis / 1000:.0f}km" if vis else "--"),
-            ("云量", f"{d.get('clouds', '--')}%"),
+            ("体感", f"{round(feels_like)}°" if feels_like is not None else "--"),
+            ("湿度", f"{humidity}%" if humidity is not None else "--"),
+            ("风", wind or "--"),
+            ("气压", f"{pressure:.0f} hPa" if isinstance(pressure, (int, float)) else "--"),
+            ("能见度", f"{vis / 1000:.0f} km" if vis is not None else "--"),
+            ("云量", f"{d['clouds']}%" if d.get("clouds") is not None else "--"),
+            ("紫外线", uv_text),
+            ("降水", f"{precipitation:g} mm" if precipitation is not None else "--"),
             ("日出", _fmt_clock(d.get("sunrise"), tz)),
             ("日落", _fmt_clock(d.get("sunset"), tz)),
+            ("空气质量", aqi_text, _aqi_color(aqi, d.get("aqi_level"))),
+            ("更新", _clock_text(d.get("report_time")) or "--"),
         ])
+        minutely = d.get("minutely") or ""
+        self.stamp.setText(minutely)
+        self.stamp.setVisible(bool(minutely))
+
+        alerts = d.get("alerts") or []
+        if alerts:
+            first = alerts[0]
+            title = first.get("title") or "".join(filter(None, (first.get("type"), first.get("level"), "预警")))
+            line = f"⚠ {title}"
+            when = _clock_text(first.get("publish_time"))
+            if first.get("publisher"):
+                line += f" · {first['publisher']}"
+            if when:
+                line += f" · {when} 发布"
+            if len(alerts) > 1:
+                line += f" · 共 {len(alerts)} 条"
+            self.alert.setText(line)
+            tips = []
+            for item in alerts:
+                tip = [item.get("title") or ""]
+                if item.get("publish_time"):
+                    tip.append(str(item["publish_time"]))
+                if item.get("text"):
+                    tip.append(str(item["text"]))
+                if item.get("guidance"):
+                    tip.append(" ".join(str(value) for value in item["guidance"]))
+                tips.append("\n".join(part for part in tip if part))
+            self.alert.setToolTip("\n\n".join(tips))
+            self.alert.show()
+        else:
+            self.alert.hide()
+
+        air = _air_text(d)
+        self.pollutants.setText(air)
+        self.pollutants.setVisible(bool(air))
+        life = d.get("life_indices") or []
+        self.life.set_items(life)
+        self.life_title.setVisible(bool(life))
+        self.life.setVisible(bool(life))
+
         self.hourly.tz = tz
         self.hourly.set_items(d.get("hourly") or [])
         self.daily.set_items(d.get("daily") or [])
 
+        # 高度随实际显示的区块伸缩，避免留白或挤压。
+        parts = [self._hero_h, self.facts.height()]
+        if alerts:
+            parts.append(self.alert.sizeHint().height())
+        if air:
+            parts.append(self.pollutants.sizeHint().height())
+        parts.append(self.hourly.height())
+        if life:
+            parts += [self.life_title.sizeHint().height(), self.life.height()]
+        self.set_height(38 + sum(parts) + 6 * (len(parts) - 1))
+
     def _menu(self, i: int):
         from .system import styled_menu
         m = styled_menu(self)
+        m.addAction("修改城市").triggered.connect(lambda: self._edit_city(i))
         if i > 0:
             m.addAction("设为默认").triggered.connect(lambda: self._default(i))
+        else:
+            m.addAction("默认城市").setEnabled(False)
         a = m.addAction("删除该城市")
         a.setEnabled(len(self.data) > 1)
         a.triggered.connect(lambda: self._remove(i))
@@ -585,11 +744,25 @@ class WeatherPage(Page):
         self.ctx.weather.remove_city(i)
 
     def _start_add(self):
-        self.add_btn.hide()
+        self._editing = None
+        self.add_edit.setPlaceholderText("城市名")
         self.add_edit.clear()
+        self._open_editor()
+
+    def _edit_city(self, i: int):
+        if not 0 <= i < len(self.data):
+            return
+        self._editing = i
+        self.add_edit.setPlaceholderText("修改城市名")
+        self.add_edit.setText(self.data[i].get("name") or self.data[i].get("city") or "")
+        self._open_editor()
+
+    def _open_editor(self):
+        self.add_btn.hide()
         self.add_edit.show()
         self.want_focus()
         self.add_edit.setFocus()
+        self.add_edit.selectAll()
         # 点到输入框以外的任何地方就取消（灵动岛内外都算）
         import ctypes
         u32 = ctypes.WinDLL("user32")
@@ -619,6 +792,7 @@ class WeatherPage(Page):
     def _end_add(self):
         self.add_edit.hide()
         self.add_btn.show()
+        self._editing = None
         if getattr(self, "_add_watch", None) is not None:
             self._add_watch.stop()
         if self.island is not None:
@@ -627,14 +801,22 @@ class WeatherPage(Page):
     def _do_add(self):
         q = self.add_edit.text().strip()
         if q:
-            self.msg.setText(f"正在查找 {q}…")
-            self.ctx.weather.add_city(q)
+            if self._editing is not None:
+                self._pending_sel = self._editing
+                self.msg.setText(f"正在修改为 {q}…")
+                self.ctx.weather.edit_city(self._editing, q)
+            else:
+                self._pending_sel = None
+                self.msg.setText(f"正在查找 {q}…")
+                self.ctx.weather.add_city(q)
         self._end_add()
 
     def _added(self, ok: bool, text: str):
         self.msg.setText(text)
         if ok:
-            self.sel = len(self.data)       # 新城市在末尾，刷新后选中它
+            # 新增选中末尾；修改保持原位置。
+            self.sel = self._pending_sel if self._pending_sel is not None else len(self.data)
+        self._pending_sel = None
         QtCore.QTimer.singleShot(4000, lambda: self.msg.setText(""))
 
     def eventFilter(self, obj, ev):
@@ -652,30 +834,105 @@ class WeatherPage(Page):
 
 
 class Facts(QtWidgets.QWidget, Themed):
-    """详情网格：两行四列的小标签。"""
+    """详情网格：三行四列的小标签；第三项可选状态色圆点。"""
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.items: list[tuple[str, str]] = []
-        self.setFixedHeight(44)
+        self.items: list[tuple[str, str, QtGui.QColor | None]] = []
+        self.setFixedHeight(72)
         self._hook_theme()
 
     def set_items(self, items):
-        self.items = items
+        self.items = [(item[0], item[1], item[2] if len(item) > 2 else None) for item in items]
         self.update()
 
     def paintEvent(self, e):
         p = painter(self)
         cols = 4
         cw = self.width() / cols
-        rh = self.height() / 2
-        for i, (k, v) in enumerate(self.items[:8]):
+        rh = self.height() / 3
+        # 每列标签宽度取该列最长标签，值紧跟其后，避免疏密不一。
+        label_fm = QtGui.QFontMetrics(ui_font(11))
+        widths = [0] * cols
+        for i, (k, _v, _dot) in enumerate(self.items[:12]):
+            widths[i % cols] = max(widths[i % cols], label_fm.horizontalAdvance(k))
+        for i, (k, v, dot) in enumerate(self.items[:12]):
             x, y = (i % cols) * cw, (i // cols) * rh
+            lw = widths[i % cols]
             p.setFont(ui_font(11))
             p.setPen(theme.text3())
-            p.drawText(QtCore.QRectF(x, y, 44, rh), Qt.AlignmentFlag.AlignVCenter, k)
+            p.drawText(QtCore.QRectF(x, y, lw, rh), Qt.AlignmentFlag.AlignVCenter, k)
+            tx = x + lw + 8
+            if dot is not None:
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(dot)
+                p.drawEllipse(QtCore.QPointF(tx + 3, y + rh / 2), 3, 3)
+                tx += 9
             p.setFont(ui_font(12, W.Medium, num=True))
             p.setPen(theme.text())
-            p.drawText(QtCore.QRectF(x + 44, y, cw - 46, rh), Qt.AlignmentFlag.AlignVCenter, v)
+            fm = QtGui.QFontMetrics(p.font())
+            text = fm.elidedText(str(v), Qt.TextElideMode.ElideRight, int(x + cw - 4 - tx))
+            p.drawText(QtCore.QRectF(tx, y, cw - (tx - x) - 4, rh), Qt.AlignmentFlag.AlignVCenter, text)
+
+
+class LifeGrid(QtWidgets.QWidget, Themed):
+    """生活指数：六列网格；悬停查看建议。"""
+    COLS = 6
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.items: list[dict] = []
+        self.setFixedHeight(54)
+        self.setMouseTracking(True)
+        self._hook_theme()
+
+    def set_items(self, items):
+        self.items = list(items or [])[:18]
+        rows = max(1, (len(self.items) + self.COLS - 1) // self.COLS)
+        self.setFixedHeight(rows * 18)
+        self.setToolTip("")
+        self.update()
+
+    def paintEvent(self, e):
+        if not self.items:
+            return
+        p = painter(self)
+        cw = self.width() / self.COLS
+        rh = self.height() / max(1, (len(self.items) + self.COLS - 1) // self.COLS)
+        name_fm = QtGui.QFontMetrics(ui_font(10.5))
+        for i, item in enumerate(self.items):
+            x, y = (i % self.COLS) * cw, (i // self.COLS) * rh
+            name = str(item.get("name", ""))
+            nw = name_fm.horizontalAdvance(name)
+            p.setFont(ui_font(10.5))
+            p.setPen(theme.text3())
+            p.drawText(QtCore.QRectF(x, y, nw, rh), Qt.AlignmentFlag.AlignVCenter, name)
+            p.setFont(ui_font(10.5, W.Medium))
+            p.setPen(theme.text2())
+            fm = QtGui.QFontMetrics(p.font())
+            lx = x + nw + 6
+            text = fm.elidedText(str(item.get("level") or ""), Qt.TextElideMode.ElideRight, int(cw - nw - 18))
+            p.drawText(QtCore.QRectF(lx, y, cw - nw - 18, rh), Qt.AlignmentFlag.AlignVCenter, text)
+
+    def mouseMoveEvent(self, e):
+        if not self.items:
+            return
+        cw = self.width() / self.COLS
+        rows = max(1, (len(self.items) + self.COLS - 1) // self.COLS)
+        rh = self.height() / rows
+        index = int(e.position().y() // rh) * self.COLS + int(e.position().x() // cw)
+        if 0 <= index < len(self.items):
+            item = self.items[index]
+            tip = f"{item.get('name', '')}：{item.get('level', '')}"
+            if item.get("brief"):
+                tip += f"（{item['brief']}）"
+            if item.get("advice"):
+                tip += f"\n{item['advice']}"
+            self.setToolTip(tip)
+        else:
+            self.setToolTip("")
+
+    def leaveEvent(self, e):
+        self.setToolTip("")
 
 
 _ = (cfg, clamp)

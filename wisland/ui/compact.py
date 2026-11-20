@@ -310,6 +310,9 @@ class CompactView:
         # 收起态音乐视图右侧的播放 / 暂停键（灵动岛坐标，绘制时更新）
         self.play_rect: QtCore.QRectF | None = None
         self.play_hover = 0.0
+        # 天气图标相对温度数字的纵向偏移（字体度量算一次，按图标 / 温度缓存）
+        self._weather_dy = 0.0
+        self._weather_dy_key: tuple | None = None
 
     # --- 数据 ---
     def set_media(self, m: dict):
@@ -535,7 +538,7 @@ class CompactView:
 
     def _badges(self, p, right: float, cy: float, a: float) -> float:
         x = right
-        for kind in ("mail", "wechat", "qq"):
+        for kind in ("mail", "wechat", "qq", "dingtalk"):
             if self.badges.get(kind):
                 c = QtGui.QColor(KIND_COLORS.get(kind, KIND_COLORS["other"]))
                 c.setAlphaF(a)
@@ -546,27 +549,44 @@ class CompactView:
         return x
 
     def _paint_idle(self, p, r, a):
+        """绘制时间；右侧没有天气或可见未读提示时在胶囊内居中。"""
         cy = r.center().y()
         now = time.localtime()
         p.setFont(ui_font(15, W.DemiBold, num=True))
         p.setPen(theme.text(a))
         txt = time.strftime("%H:%M", now)
-        p.drawText(QtCore.QRectF(r.x() + 18, r.y(), 80, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+        has_right_content = bool(self.weather) or any(self.badges.get(kind) for kind in ("mail", "wechat", "qq", "dingtalk"))
+        if has_right_content:
+            p.drawText(QtCore.QRectF(r.x() + 18, r.y(), 80, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, txt)
+        else:
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, txt)
         x = r.right() - 16
         x = self._badges(p, x, cy, a) - 4
         if self.weather:
             glyph, temp = self.weather[0], self.weather[1]
             fam = self.weather[2] if len(self.weather) > 2 else None
-            p.setFont(ui_font(13, W.Medium, num=True))
+            tf = ui_font(13, W.Medium, num=True)
+            p.setFont(tf)
             p.setPen(theme.text2(a))
-            fm = QtGui.QFontMetrics(p.font())
+            fm = QtGui.QFontMetricsF(tf)
             tw = fm.horizontalAdvance(temp)
             p.drawText(QtCore.QRectF(x - tw, r.y(), tw + 2, r.height()), Qt.AlignmentFlag.AlignVCenter, temp)
             f = icon_font(13)
             if fam:
                 f.setFamilies([fam, "Segoe Fluent Icons", "Segoe UI Symbol"])
             p.setFont(f)
-            p.drawText(QtCore.QRectF(x - tw - 22, r.y(), 20, r.height()), Qt.AlignmentFlag.AlignCenter, glyph)
+            # 天气图标字体与数字字体的上下留白不同，直接 AlignCenter 会让太阳比 "11°" 高一截。
+            # 按两种字体的墨迹中线求出偏移，让图标的视觉中线落在温度数字上。
+            key = (glyph, temp, fam)
+            if key != self._weather_dy_key:
+                im_ = QtGui.QFontMetricsF(f)
+                tbr = fm.tightBoundingRect(temp)
+                ibr = im_.tightBoundingRect(glyph)
+                self._weather_dy = ((fm.ascent() - fm.descent() + tbr.top() + tbr.bottom())
+                                    - (im_.ascent() - im_.descent() + ibr.top() + ibr.bottom())) / 2
+                self._weather_dy_key = key
+            p.drawText(QtCore.QRectF(x - tw - 22, r.y() + self._weather_dy, 20, r.height()),
+                       Qt.AlignmentFlag.AlignCenter, glyph)
 
     def _paint_media(self, p, r, a):
         cy = r.center().y()

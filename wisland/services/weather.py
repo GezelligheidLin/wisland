@@ -1,433 +1,653 @@
 # -*- coding: utf-8 -*-
-"""天气：默认用 Open-Meteo（免费、无需 Key）；填了 weather.api_key 则改用 OpenWeatherMap。
-
-信号 updated(dict):
-  {ok, error, city, temp, feels_like, desc, icon('10d'), humidity, wind, sunrise, sunset(epoch),
-   hourly: [{time, temp, icon, pop}] 接下来 8 个 3 小时步长,
-   daily:  [{date('YYYY-MM-DD'), min, max, icon}] 接下来最多 5 天（按城市当地日期聚合）,
-   time(epoch 获取时间)}
-
-图标：
-  fluent_icon(code)   -> Segoe Fluent Icons 字形。Fluent 字体里只有 3 个天气相关字形（已在本机字体中逐一
-                         渲染核对，官方列表中没有雨/雪/雷等）：E706 Brightness(太阳) / E708 QuietHours(月亮) /
-                         E753 Cloud(云)。所以只能区分 晴(日)/晴(夜)/其它=云。
-  weather_glyph(code) -> (字符, 字体族) 更细的映射：雨、雪、雷、雾等用 "Segoe UI Symbol" 的单色天气符号
-                         （U+2600 ☀、U+2601 ☁、U+1F324 🌤、U+1F327 🌧、U+1F326 🌦、U+1F329 🌩、U+2744 ❄、U+1F32B 🌫，
-                         均在本机 Segoe UI Symbol 中以单色渲染核对过）；晴夜用 Fluent 的月亮 E708
-                         （Segoe UI Symbol 无单色月亮，会回落到彩色 emoji）。
-"""
+"""城市天气：使用 UAPIs 天气接口，每个城市每天最多请求一次并持久缓存结果。"""
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import time
-from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
+from pathlib import Path
 
 import httpx
-from PySide6 import QtCore
+from PySide6 import QtCore, QtGui
 
 from wisland.core.bg import run_bg, ui
-from wisland.core.config import cfg
+from wisland.core.config import DATA_DIR, cfg
 
-API = "https://api.openweathermap.org/data/2.5"
-OM_API = "https://api.open-meteo.com/v1/forecast"
-OM_GEO = "https://geocoding-api.open-meteo.com/v1/search"
+API = "https://uapis.cn/api/v1/misc/weather"
+_CACHE_VERSION = 2  # v2 增加空气质量、生活指数、分钟级降水等字段
+_ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
+_ICON_CSS = _ASSET_DIR / "qweather-icons.css"
+_ICON_FONT = _ASSET_DIR / "qweather-icons.ttf"
+_ICON_MAP: dict[str, str] | None = None
+_FONT_FAMILY: str | None = None
+_FONT_ATTEMPTED = False
+_FALLBACK_ICON = ("\uE753", "Segoe Fluent Icons")
 
-# WMO 天气代码 -> (中文描述, OpenWeather 图标前缀)；图标前缀复用现有的字形映射
-_WMO = {
-    0: ("晴", "01"), 1: ("晴间多云", "02"), 2: ("多云", "03"), 3: ("阴", "04"),
-    45: ("雾", "50"), 48: ("雾凇", "50"),
-    51: ("小毛毛雨", "09"), 53: ("毛毛雨", "09"), 55: ("大毛毛雨", "09"), 56: ("冻毛毛雨", "09"), 57: ("冻毛毛雨", "09"),
-    61: ("小雨", "10"), 63: ("中雨", "10"), 65: ("大雨", "10"), 66: ("冻雨", "13"), 67: ("冻雨", "13"),
-    71: ("小雪", "13"), 73: ("中雪", "13"), 75: ("大雪", "13"), 77: ("雪粒", "13"),
-    80: ("阵雨", "09"), 81: ("阵雨", "09"), 82: ("强阵雨", "09"), 85: ("阵雪", "13"), 86: ("强阵雪", "13"),
-    95: ("雷暴", "11"), 96: ("雷暴伴冰雹", "11"), 99: ("雷暴伴冰雹", "11"),
+
+# The UAPI current-weather response includes QWeather-compatible icon codes.
+# Forecast rows may only contain descriptions, so map those to the same icon set.
+_TEXT_ICON_CODES = {
+    "特大暴雨": "312", "大暴雨": "311", "暴雨": "310", "极端降雨": "308",
+    "大雨到暴雨": "316", "暴雨到大暴雨": "317", "大暴雨到特大暴雨": "318",
+    "中到大雨": "315", "小到中雨": "314", "雷阵雨伴有冰雹": "304",
+    "强雷阵雨": "303", "雷阵雨": "302", "强阵雨": "301", "阵雨": "300",
+    "冻雨": "313", "毛毛雨": "309", "小雨": "305", "中雨": "306", "大雨": "307",
+    "大雪到暴雪": "410", "中到大雪": "409", "小到中雪": "408", "阵雨夹雪": "406",
+    "雨雪": "405", "雨夹雪": "404", "暴雪": "403", "大雪": "402", "中雪": "401",
+    "小雪": "400", "阵雪": "407", "雪": "499", "强阵雪": "457", "阵雪（夜间）": "457",
+    "阵雨（夜间）": "350", "强阵雨（夜间）": "351", "沙尘暴": "507", "强沙尘暴": "508",
+    "扬沙": "503", "浮尘": "502", "霾": "502", "重度霾": "504", "中度霾": "503",
+    "严重霾": "504", "浓雾": "501", "大雾": "501", "雾": "501", "薄雾": "500",
+    "晴间多云": "103", "少云": "102", "多云": "101", "阴": "104", "晴": "100",
+    "thunderstorm with hail": "304", "strong thunderstorm": "303", "thunderstorm": "302",
+    "heavy rainstorm": "312", "heavy rain": "307", "moderate rain": "306", "light rain": "305",
+    "rain shower": "300", "shower": "300", "drizzle": "309", "freezing rain": "313",
+    "heavy snow": "402", "moderate snow": "401", "light snow": "400", "snow": "499",
+    "rain and snow": "404", "sleet": "404", "sandstorm": "507", "dust": "502",
+    "haze": "502", "fog": "501", "overcast": "104", "mostly cloudy": "101",
+    "cloudy": "101", "partly cloudy": "103", "sunny": "100", "clear": "100",
+}
+_NIGHT_ICON_CODES = {"100": "150", "101": "151", "102": "152", "103": "153",
+                     "300": "350", "301": "351"}
+
+_LIFE_NAMES = {
+    "clothing": "穿衣", "uv": "紫外线", "car_wash": "洗车", "drying": "晾晒",
+    "air_conditioner": "空调", "cold_risk": "感冒", "exercise": "运动", "comfort": "舒适度",
+    "travel": "出行", "fishing": "钓鱼", "allergy": "过敏", "sunscreen": "防晒",
+    "mood": "心情", "beer": "啤酒", "umbrella": "雨伞", "traffic": "交通",
+    "air_purifier": "空气净化", "pollen": "花粉",
 }
 
 
-def _wmo(code, day=True) -> tuple[str, str]:
-    desc, base = _WMO.get(int(code or 0), ("", "03"))
-    return desc, base + ("d" if day else "n")
+def _icon_map() -> dict[str, str]:
+    """Read the official QWeather font's CSS codepoint map bundled with the app."""
+    global _ICON_MAP
+    if _ICON_MAP is None:
+        try:
+            css = _ICON_CSS.read_text(encoding="utf-8")
+            _ICON_MAP = {
+                code: chr(int(point, 16))
+                for code, point in re.findall(
+                    r"\.qi-(\d+)::before\s*\{\s*content:\s*\"\\([0-9a-fA-F]+)\"",
+                    css,
+                )
+            }
+        except OSError:
+            _ICON_MAP = {}
+    return _ICON_MAP
 
 
-def parse_open_meteo(j: dict) -> dict:
-    """Open-Meteo /v1/forecast（timeformat=unixtime）-> 与 parse() 相同结构。"""
-    cur = j.get("current") or {}
-    daily = j.get("daily") or {}
-    hourly = j.get("hourly") or {}
-    tz_off = int(j.get("utc_offset_seconds") or 0)
-    desc, icon = _wmo(cur.get("weather_code"), bool(cur.get("is_day", 1)))
-    d0 = lambda k: (daily.get(k) or [None])[0]  # noqa: E731
-    out = {
-        "ok": True, "error": "", "city": "",
-        "temp": cur.get("temperature_2m"), "feels_like": cur.get("apparent_temperature"),
-        "desc": desc, "icon": icon, "humidity": cur.get("relative_humidity_2m"),
-        "wind": cur.get("wind_speed_10m"), "wind_deg": cur.get("wind_direction_10m"),
-        "sunrise": d0("sunrise"), "sunset": d0("sunset"),
-        "pressure": cur.get("pressure_msl"), "visibility": cur.get("visibility"),
-        "clouds": cur.get("cloud_cover"),
-        "temp_min": d0("temperature_2m_min"), "temp_max": d0("temperature_2m_max"),
-        "tz_offset": tz_off, "hourly": [], "daily": [], "time": time.time(),
-    }
-    now = time.time()
-    times = hourly.get("time") or []
-    start = next((i for i, t in enumerate(times) if t >= now - 1800), 0)
-    for i in range(start + 1, min(len(times), start + 1 + 24), 3):        # 从下一个整点起，3 小时一格
-        hd, hicon = _wmo((hourly.get("weather_code") or [0])[i], bool((hourly.get("is_day") or [1] * len(times))[i]))
-        pop = (hourly.get("precipitation_probability") or [0] * len(times))[i] or 0
-        out["hourly"].append({"time": times[i], "temp": (hourly.get("temperature_2m") or [None])[i],
-                              "icon": hicon, "pop": float(pop) / 100.0})
-    tz = timezone(timedelta(seconds=tz_off))
-    for i, t in enumerate((daily.get("time") or [])[:5]):
-        _, dicon = _wmo((daily.get("weather_code") or [0])[i], True)
-        out["daily"].append({"date": datetime.fromtimestamp(int(t), tz).strftime("%Y-%m-%d"),
-                             "min": (daily.get("temperature_2m_min") or [None])[i],
-                             "max": (daily.get("temperature_2m_max") or [None])[i], "icon": dicon})
-    return out
-NO_KEY_MSG = "未设置 OpenWeather API Key（config.json → weather.api_key）"
-
-FLUENT_FONT = "Segoe Fluent Icons"
-SYMBOL_FONT = "Segoe UI Symbol"
-G_SUN = "\uE706"     # Brightness
-G_MOON = "\uE708"    # QuietHours（月牙）
-G_CLOUD = "\uE753"   # Cloud
+def _icon_font_family() -> str | None:
+    """Load the bundled QWeather font once after the Qt application exists."""
+    global _FONT_ATTEMPTED, _FONT_FAMILY
+    if _FONT_FAMILY:
+        return _FONT_FAMILY
+    if _FONT_ATTEMPTED or QtGui.QGuiApplication.instance() is None:
+        return None
+    _FONT_ATTEMPTED = True
+    font_id = QtGui.QFontDatabase.addApplicationFont(str(_ICON_FONT))
+    if font_id >= 0:
+        families = QtGui.QFontDatabase.applicationFontFamilies(font_id)
+        if families:
+            _FONT_FAMILY = families[0]
+    return _FONT_FAMILY
 
 
-def fluent_icon(owm_code: str) -> str:
-    """OWM 图标代码（如 '10d'）-> Segoe Fluent Icons 字形（只有 日/月/云 三种）。"""
-    c = str(owm_code or "")
-    if c.startswith("01"):
-        return G_MOON if c.endswith("n") else G_SUN
-    return G_CLOUD
+def weather_glyph(icon_code: str) -> tuple[str, str]:
+    """Return a QWeather Icons glyph and font family for a weather icon code."""
+    code = str(icon_code or "")
+    glyph = _icon_map().get(code)
+    family = _icon_font_family()
+    if glyph and family:
+        return glyph, family
+    return _FALLBACK_ICON
 
 
-_SYMBOL = {
-    "01d": ("\u2600", SYMBOL_FONT),        # ☀
-    "01n": (G_MOON, FLUENT_FONT),
-    "02d": ("\U0001F324", SYMBOL_FONT),    # 🌤 少云
-    "02n": ("\u2601", SYMBOL_FONT),
-    "03": ("\u2601", SYMBOL_FONT),         # ☁
-    "04": ("\u2601", SYMBOL_FONT),
-    "09": ("\U0001F327", SYMBOL_FONT),     # 🌧 阵雨
-    "10d": ("\U0001F326", SYMBOL_FONT),    # 🌦 晴间雨
-    "10n": ("\U0001F327", SYMBOL_FONT),
-    "11": ("\U0001F329", SYMBOL_FONT),     # 🌩 雷
-    "13": ("\u2744", SYMBOL_FONT),         # ❄
-    "50": ("\U0001F32B", SYMBOL_FONT),     # 🌫 雾/霾
-}
+def _icon_from_description(description: str, hour: int | None = None) -> str:
+    text = str(description or "").strip().casefold()
+    code = next((value for label, value in sorted(_TEXT_ICON_CODES.items(), key=lambda item: len(item[0]), reverse=True)
+                 if label.casefold() in text), "999")
+    if hour is not None and (hour >= 18 or hour < 6):
+        code = _NIGHT_ICON_CODES.get(code, code)
+    return code
 
 
-def weather_glyph(owm_code: str) -> tuple[str, str]:
-    """OWM 图标代码 -> (字符, 字体族)。"""
-    c = str(owm_code or "")
-    return _SYMBOL.get(c) or _SYMBOL.get(c[:2]) or (G_CLOUD, FLUENT_FONT)
+def _epoch_and_offset(value) -> tuple[int | None, int, bool]:
+    """Parse API forecast time into Unix seconds, UTC offset and offset presence."""
+    if isinstance(value, (int, float)):
+        return int(value), 0, False
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None, 0, False
+    has_offset = parsed.tzinfo is not None
+    if not has_offset:
+        parsed = parsed.astimezone()
+    offset = parsed.utcoffset()
+    return int(parsed.timestamp()), int(offset.total_seconds()) if offset else 0, has_offset
 
 
-def _icon_rank(icon: str) -> int:
-    """聚合一天的图标时，优先显示"更坏"的天气。"""
-    order = {"11": 7, "13": 6, "09": 5, "10": 5, "50": 3, "04": 2, "03": 2, "02": 1, "01": 0}
-    return order.get(str(icon)[:2], 0)
+def _number(value) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
-def parse(cur: dict, fc: dict | None) -> dict:
-    """把 /weather 与 /forecast 的 JSON 解析成 updated 信号的载荷。"""
-    w = (cur.get("weather") or [{}])[0]
-    main = cur.get("main") or {}
-    sys_ = cur.get("sys") or {}
-    out = {
-        "ok": True, "error": "",
-        "city": cur.get("name") or "",
-        "temp": main.get("temp"),
-        "feels_like": main.get("feels_like"),
-        "desc": w.get("description") or w.get("main") or "",
-        "icon": w.get("icon") or "",
-        "humidity": main.get("humidity"),
-        "wind": (cur.get("wind") or {}).get("speed"),
-        "sunrise": sys_.get("sunrise"),
-        "sunset": sys_.get("sunset"),
-        "pressure": main.get("pressure"),
-        "visibility": cur.get("visibility"),
-        "clouds": (cur.get("clouds") or {}).get("all"),
-        "wind_deg": (cur.get("wind") or {}).get("deg"),
-        "temp_min": main.get("temp_min"),
-        "temp_max": main.get("temp_max"),
-        "tz_offset": int(cur.get("timezone") or 0),
-        "hourly": [], "daily": [],
-        "time": time.time(),
-    }
-    if not fc:
-        return out
-    tz_off = int((fc.get("city") or {}).get("timezone", cur.get("timezone", 0)) or 0)
-    tz = timezone(timedelta(seconds=tz_off))
-    items = fc.get("list") or []
-    for it in items[:8]:
-        out["hourly"].append({
-            "time": it.get("dt"),
-            "temp": (it.get("main") or {}).get("temp"),
-            "icon": ((it.get("weather") or [{}])[0]).get("icon", ""),
-            "pop": float(it.get("pop") or 0.0),
-        })
-    days: dict[str, dict] = defaultdict(lambda: {"min": None, "max": None, "icons": []})
-    order: list[str] = []
-    for it in items:
-        dt = it.get("dt")
-        if dt is None:
+def _local_clock_epoch(day_value, clock_value, tz_offset: int) -> int | None:
+    """Convert a city's YYYY-MM-DD and HH:MM forecast values to Unix seconds."""
+    if isinstance(clock_value, (int, float)):
+        return int(clock_value)
+    if not day_value or not clock_value:
+        return None
+    try:
+        day = date.fromisoformat(str(day_value)[:10])
+        clock = datetime_time.fromisoformat(str(clock_value))
+        local = datetime.combine(day, clock, timezone(timedelta(seconds=tz_offset)))
+        return int(local.timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_uapis_weather(payload: dict, requested_city: str = "", lang: str = "zh") -> dict:
+    """Normalize one UAPIs current/forecast response for the existing weather UI."""
+    if not isinstance(payload, dict) or payload.get("temperature") is None:
+        message = (payload.get("message") or payload.get("detail") or payload.get("error")) if isinstance(payload, dict) else None
+        raise ValueError(str(message or "天气服务返回的数据不完整"))
+
+    forecast = payload.get("forecast") if isinstance(payload.get("forecast"), list) else []
+    today_forecast = forecast[0] if forecast and isinstance(forecast[0], dict) else {}
+    hourly_source = payload.get("hourly_forecast") if isinstance(payload.get("hourly_forecast"), list) else []
+    _, tz_offset, has_api_offset = (_epoch_and_offset(hourly_source[0].get("time"))
+                                    if hourly_source and isinstance(hourly_source[0], dict) else (None, 0, False))
+    if not has_api_offset:
+        local_offset = datetime.now().astimezone().utcoffset()
+        tz_offset = int(local_offset.total_seconds()) if local_offset else 0
+
+    current_desc = str(payload.get("weather") or "")
+    current_icon = str(payload.get("weather_icon") or _icon_from_description(current_desc, 12))
+    temp_min = _number(payload.get("temp_min", today_forecast.get("temp_min")))
+    temp_max = _number(payload.get("temp_max", today_forecast.get("temp_max")))
+    visibility_km = _number(payload.get("visibility"))
+    wind_speed = _number(payload.get("wind_speed"))
+    air_source = payload.get("air_pollutants") if isinstance(payload.get("air_pollutants"), dict) else {}
+    air = {key: _number(air_source.get(key)) for key in ("pm25", "pm10", "o3", "no2", "so2", "co")}
+    alerts = []
+    for item in payload.get("alerts") if isinstance(payload.get("alerts"), list) else []:
+        if not isinstance(item, dict):
             continue
-        local = datetime.fromtimestamp(int(dt), tz)
-        key = local.strftime("%Y-%m-%d")
-        if key not in days:
-            order.append(key)
-        d = days[key]
-        m = it.get("main") or {}
-        lo, hi = m.get("temp_min", m.get("temp")), m.get("temp_max", m.get("temp"))
-        if lo is not None:
-            d["min"] = lo if d["min"] is None else min(d["min"], lo)
-        if hi is not None:
-            d["max"] = hi if d["max"] is None else max(d["max"], hi)
-        icon = ((it.get("weather") or [{}])[0]).get("icon", "")
-        if icon and 6 <= local.hour <= 21:  # 白天时段决定当天图标
-            d["icons"].append(icon)
-        elif icon and not d["icons"]:
-            d["icons"].append(icon)
-    # 当前天气里的 temp_min / temp_max 只是「此刻城市内各观测点的差异」，不是全天最低最高；
-    # 预报里今天又只剩还没过去的时段。两者合起来作为今天的最低 / 最高，左侧和右侧「今天」用同一组数。
-    today = datetime.now(tz).strftime("%Y-%m-%d")
-    if today in days:
-        d = days[today]
-        for v in (out["temp"], out["temp_min"], out["temp_max"]):
-            if v is not None:
-                d["min"] = v if d["min"] is None else min(d["min"], v)
-                d["max"] = v if d["max"] is None else max(d["max"], v)
-        out["temp_min"], out["temp_max"] = d["min"], d["max"]
-    for key in order[:5]:
-        d = days[key]
-        icons = d["icons"]
-        icon = ""
-        if icons:
-            cnt = Counter(i[:2] for i in icons)
-            # 最常见的；若有降水/雷暴出现 2 次以上，则显示更坏的那种
-            common = cnt.most_common(1)[0][0]
-            worst = max(cnt, key=lambda k: (_icon_rank(k), cnt[k]))
-            pick = worst if _icon_rank(worst) >= 5 and cnt[worst] >= 2 else common
-            icon = pick + "d"
-        out["daily"].append({"date": key, "min": d["min"], "max": d["max"], "icon": icon})
-    # 当前天气补充当地时区偏移（UI 显示日出日落可用）
-    out["tz_offset"] = tz_off
+        guidance = item.get("guidance") if isinstance(item.get("guidance"), list) else []
+        alert_type = str(item.get("type") or "").strip()
+        alert_level = str(item.get("level") or "").strip()
+        alerts.append({
+            "title": str(item.get("title") or f"{alert_type}{alert_level}预警").strip(),
+            "type": alert_type,
+            "level": alert_level,
+            "text": str(item.get("text") or item.get("description") or "").strip(),
+            "publisher": str(item.get("publisher") or item.get("sender") or "").strip(),
+            "publish_time": str(item.get("publish_time") or item.get("time") or "").strip(),
+            "guidance": [str(value).strip() for value in guidance if str(value).strip()],
+        })
+    life_indices = []
+    life_source = payload.get("life_indices") if isinstance(payload.get("life_indices"), dict) else {}
+    for key, item in life_source.items():
+        if not isinstance(item, dict):
+            continue
+        level = str(item.get("level") or item.get("brief") or "").strip()
+        if not level:
+            continue
+        life_indices.append({
+            "key": str(key), "name": _LIFE_NAMES.get(str(key), str(key)),
+            "level": level, "brief": str(item.get("brief") or "").strip(),
+            "advice": str(item.get("advice") or "").strip(),
+        })
+    minutely_source = payload.get("minutely_forecast")
+    if not isinstance(minutely_source, dict):
+        minutely_source = payload.get("minutely_precip")
+    minutely = str(minutely_source.get("summary") or "").strip() if isinstance(minutely_source, dict) else ""
+    out = {
+        "ok": True, "error": "", "city": payload.get("city") or requested_city,
+        "temp": _number(payload.get("temperature")),
+        "feels_like": _number(payload.get("feels_like")),
+        "desc": current_desc, "icon": current_icon,
+        "humidity": payload.get("humidity"),
+        "wind": payload.get("wind_power") or "",
+        "wind_speed": wind_speed,
+        "wind_direction": payload.get("wind_direction") or "",
+        "wind_deg": None,
+        "sunrise": _local_clock_epoch(today_forecast.get("date"),
+                                      payload.get("sunrise") or today_forecast.get("sunrise"), tz_offset),
+        "sunset": _local_clock_epoch(today_forecast.get("date"),
+                                     payload.get("sunset") or today_forecast.get("sunset"), tz_offset),
+        "pressure": payload.get("pressure"),
+        # The current UI formats visibility in meters, while UAPIs reports kilometers.
+        "visibility": visibility_km * 1000 if visibility_km is not None else None,
+        "clouds": payload.get("cloud"),
+        "uv": _number(payload.get("uv")),
+        "precipitation": _number(payload.get("precipitation")),
+        "aqi": _number(payload.get("aqi")),
+        "aqi_level": payload.get("aqi_level"),
+        "aqi_category": str(payload.get("aqi_category") or "").strip(),
+        "aqi_primary": str(payload.get("aqi_primary") or "").strip(),
+        "air": {key: value for key, value in air.items() if value is not None},
+        "alerts": alerts,
+        "life_indices": life_indices,
+        "minutely": minutely,
+        "report_time": str(payload.get("report_time") or "").strip(),
+        "province": str(payload.get("province") or "").strip(),
+        "district": str(payload.get("district") or "").strip(),
+        "adcode": str(payload.get("adcode") or "").strip(),
+        "temp_min": temp_min, "temp_max": temp_max,
+        "tz_offset": tz_offset, "hourly": [], "daily": [], "time": time.time(),
+    }
+
+    tz = timezone(timedelta(seconds=tz_offset))
+    for item in hourly_source[1::3]:
+        if not isinstance(item, dict):
+            continue
+        epoch, item_offset, has_item_offset = _epoch_and_offset(item.get("time"))
+        temp = _number(item.get("temperature"))
+        if epoch is None or temp is None:
+            continue
+        item_tz = timezone(timedelta(seconds=item_offset)) if has_item_offset else tz
+        local_hour = datetime.fromtimestamp(epoch, item_tz).hour
+        pop = _number(item.get("pop")) or 0.0
+        if pop > 1:
+            pop /= 100.0
+        out["hourly"].append({
+            "time": epoch, "temp": temp,
+            "icon": str(item.get("weather_icon") or _icon_from_description(item.get("weather"), local_hour)),
+            "pop": max(0.0, min(1.0, pop)),
+            "text": str(item.get("weather") or "").strip(),
+            "wind": str(item.get("wind_scale") or "").strip(),
+            "wind_direction": str(item.get("wind_direction") or "").strip(),
+            "wind_speed": _number(item.get("wind_speed")),
+            "uv": _number(item.get("uv_index")),
+        })
+        if len(out["hourly"]) >= 8:
+            break
+
+    for item in forecast[:5]:
+        if not isinstance(item, dict):
+            continue
+        low, high = _number(item.get("temp_min")), _number(item.get("temp_max"))
+        if low is None or high is None:
+            continue
+        out["daily"].append({
+            "date": str(item.get("date") or ""), "min": low, "max": high,
+            "icon": str(item.get("weather_icon_day") or item.get("weather_icon")
+                        or _icon_from_description(item.get("weather_day") or item.get("weather_night"), 12)),
+            "text": str(item.get("weather_day") or "").strip(),
+            "text_night": str(item.get("weather_night") or "").strip(),
+            "week": str(item.get("week") or "").strip(),
+            "wind": str(item.get("wind_scale_day") or "").strip(),
+            "wind_direction": str(item.get("wind_dir_day") or "").strip(),
+            "uv": _number(item.get("uv_index")),
+            "sunrise": str(item.get("sunrise") or "").strip(),
+            "sunset": str(item.get("sunset") or "").strip(),
+        })
     return out
 
 
 class WeatherService(QtCore.QObject):
-    """多城市天气。cities_updated(list) 每个城市一份 parse() 结果（含 name / index）；
-    updated(dict) 只发第一个城市（灵动岛收起态显示它）。"""
+    """Multi-city weather with a persistent per-city, per-local-day request cache."""
     updated = QtCore.Signal(dict)
     cities_updated = QtCore.Signal(list)
-    city_added = QtCore.Signal(bool, str)      # 成功?, 提示
+    city_added = QtCore.Signal(bool, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, cache_path: str | Path | None = None):
         super().__init__(parent)
         ui(lambda: None)
-        self._client = httpx.Client(timeout=httpx.Timeout(12.0, connect=6.0), follow_redirects=True)
+        # Ignore broken system proxy settings (e.g. NO_PROXY-only registries);
+        # UAPIs is a domestic endpoint, same as the stock quotes client.
+        self._client = httpx.Client(timeout=httpx.Timeout(12.0, connect=6.0),
+                                    follow_redirects=True, trust_env=False)
         self._busy = False
         self._again = False
         self.last: dict = {}
         self.cities_data: list[dict] = []
+        self._cache_path = Path(cache_path) if cache_path else DATA_DIR / "weather_cache.json"
+        self._cache: dict = {}
+        self._run_cities: list[dict] = []
+        self._run_date = ""
+        self._pending: list[tuple[int, dict]] = []
+        self._working: list[dict | None] = []
+        self._adding: set[str] = set()
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
 
-    # ---------- 城市列表 ----------
     def cities(self) -> list[dict]:
-        cs = cfg.get("weather.cities")
-        if isinstance(cs, list) and cs:
-            return [dict(c) for c in cs if isinstance(c, dict)]
-        lat, lon = cfg.get("weather.lat"), cfg.get("weather.lon")
-        c = {"name": cfg.get("weather.city") or "Shanghai"}
-        if lat not in (None, "") and lon not in (None, ""):
-            c.update(lat=lat, lon=lon)
-        return [c]
+        configured = cfg.get("weather.cities")
+        if isinstance(configured, list):
+            cities = [dict(city) for city in configured if isinstance(city, dict)]
+            if cities:
+                return cities
+        city = {"name": cfg.get("weather.city") or "上海"}
+        adcode = cfg.get("weather.adcode")
+        if adcode:
+            city["adcode"] = adcode
+        return [city]
 
-    def _save(self, cs: list[dict]):
-        cfg.set("weather.cities", cs)
+    def _save(self, cities: list[dict]):
+        cfg.set("weather.cities", cities)
 
-    def remove_city(self, i: int):
-        cs = self.cities()
-        if 0 <= i < len(cs) and len(cs) > 1:
-            cs.pop(i)
-            self._save(cs)
-            if 0 <= i < len(self.cities_data):
-                self.cities_data.pop(i)
+    @staticmethod
+    def _city_key(city: dict) -> str:
+        identity = city.get("adcode") or city.get("q") or city.get("name") or "上海"
+        return hashlib.sha256(str(identity).strip().casefold().encode("utf-8")).hexdigest()
+
+    def _read_cache(self) -> dict:
+        try:
+            data = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            cities = data.get("cities") if isinstance(data, dict) and data.get("version") == _CACHE_VERSION else None
+            return cities if isinstance(cities, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _write_cache(self, cache: dict):
+        self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._cache_path.with_suffix(self._cache_path.suffix + ".tmp")
+        temp_path.write_text(json.dumps({"version": _CACHE_VERSION, "cities": cache}, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(self._cache_path)
+
+    def remove_city(self, index: int):
+        cities = self.cities()
+        if 0 <= index < len(cities) and len(cities) > 1:
+            cities.pop(index)
+            self._save(cities)
+            if 0 <= index < len(self.cities_data):
+                self.cities_data.pop(index)
             self._publish()
 
-    def make_default(self, i: int):
-        cs = self.cities()
-        if 0 < i < len(cs):
-            cs.insert(0, cs.pop(i))
-            self._save(cs)
-            if i < len(self.cities_data):
-                self.cities_data.insert(0, self.cities_data.pop(i))
+    def make_default(self, index: int):
+        cities = self.cities()
+        if 0 < index < len(cities):
+            cities.insert(0, cities.pop(index))
+            self._save(cities)
+            if index < len(self.cities_data):
+                self.cities_data.insert(0, self.cities_data.pop(index))
             self._publish()
 
     def add_city(self, query: str):
         query = (query or "").strip()
-        key = str(cfg.get("weather.api_key") or "").strip()
         if not query:
             self.city_added.emit(False, "请输入城市名")
             return
+        cities = self.cities()
+        if any(str(city.get("name") or city.get("q") or "").strip().casefold() == query.casefold() for city in cities):
+            self.city_added.emit(True, f"{query} 已在城市列表中")
+            return
 
-        def geo():
-            if not key:
-                return self._geocode(query)
-            r = self._client.get("https://api.openweathermap.org/geo/1.0/direct",
-                                 params={"q": query, "limit": 1, "appid": key})
-            r.raise_for_status()
-            js = r.json()
-            return js[0] if js else None
-
-        def done(g):
-            if not g:
-                self.city_added.emit(False, f"找不到城市：{query}（可试试英文名）")
+        city = {"name": query}
+        key = self._city_key(city)
+        if key in self._adding:
+            self.city_added.emit(False, f"正在查询 {query}")
+            return
+        self._adding.add(key)
+        cache = self._read_cache()
+        record = cache.get(key) if isinstance(cache.get(key), dict) else {}
+        today = date.today().isoformat()
+        if record.get("attempt_date") == today:
+            self._adding.discard(key)
+            if not isinstance(record.get("data"), dict):
+                self.city_added.emit(False, f"{query} 今日已查询且没有可用缓存，请明天再试")
                 return
-            cs = self.cities()
-            cs.append({"name": query, "lat": round(g["lat"], 4), "lon": round(g["lon"], 4),
-                       "country": g.get("country", "")})
-            self._save(cs)
-            self.city_added.emit(True, f"已添加 {query}（{g.get('country', '')}）")
+            cities.append(city)
+            self._save(cities)
+            self.city_added.emit(True, f"已添加 {query}（使用今日缓存）")
+            self.refresh()
+            return
+
+        record = dict(record)
+        record.update(attempt_date=today, error="请求结果尚未缓存（今日不自动重试）")
+        cache[key] = record
+        try:
+            self._write_cache(cache)
+        except OSError:
+            pass
+        api_key = str(cfg.get("weather.uapi_key") or "").strip()
+
+        def added(data):
+            self._adding.discard(key)
+            cities_now = self.cities()
+            if not any(str(item.get("name") or item.get("q") or "").strip().casefold() == query.casefold()
+                       for item in cities_now):
+                cities_now.append(city)
+                self._save(cities_now)
+            cached_data = {field: value for field, value in data.items() if field not in ("index", "error")}
+            cached_data["error"] = ""
+            latest_cache = self._read_cache()
+            latest_cache[key] = {"attempt_date": today, "data_date": today, "error": "", "data": cached_data}
+            try:
+                self._write_cache(latest_cache)
+            except OSError:
+                pass
+            self.city_added.emit(True, f"已添加 {query}")
             self.refresh()
 
-        def fail(e):
-            self.city_added.emit(False, "查询失败：" + self._friendly(e))
+        def failed(exc):
+            self._adding.discard(key)
+            latest_cache = self._read_cache()
+            failed_record = dict(latest_cache.get(key) or {})
+            failed_record.update(attempt_date=today, error=self._friendly(exc))
+            latest_cache[key] = failed_record
+            try:
+                self._write_cache(latest_cache)
+            except OSError:
+                pass
+            self.city_added.emit(False, f"查询失败：{self._friendly(exc)}")
 
-        run_bg(geo, on_done=done, on_error=fail)
+        run_bg(self._fetch_one, api_key, city, on_done=added, on_error=failed)
 
-    # ---------- 刷新 ----------
+    def edit_city(self, index: int, query: str):
+        """把第 index 个城市改成新名字；沿用每日缓存，未缓存时才请求一次。"""
+        query = (query or "").strip()
+        if not query:
+            self.city_added.emit(False, "请输入城市名")
+            return
+        cities = self.cities()
+        if not 0 <= index < len(cities):
+            self.city_added.emit(False, "城市不存在")
+            return
+        old = str(cities[index].get("name") or cities[index].get("q") or "")
+        if query.casefold() == old.casefold():
+            self.city_added.emit(True, "城市名未变化")
+            return
+        if any(j != index and str(c.get("name") or c.get("q") or "").strip().casefold() == query.casefold()
+               for j, c in enumerate(cities)):
+            self.city_added.emit(True, f"{query} 已在城市列表中")
+            return
+        cities[index] = {"name": query}
+        self._save(cities)
+        self.city_added.emit(True, f"已将 {old} 修改为 {query}")
+        self.refresh()
+
     def start(self):
-        try:
-            mins = max(5.0, float(cfg.get("weather.interval_min") or 15))
-        except (TypeError, ValueError):
-            mins = 15.0
-        self._timer.start(int(mins * 60_000))
         self.refresh()
 
     def stop(self):
         self._timer.stop()
 
+    def _schedule_next_day(self):
+        now = datetime.now().astimezone()
+        tomorrow = now.date() + timedelta(days=1)
+        next_midnight = datetime.combine(tomorrow, datetime_time.min, tzinfo=now.tzinfo)
+        delay_ms = max(1000, int((next_midnight - now).total_seconds() * 1000))
+        self._timer.start(delay_ms)
+
     def refresh(self):
+        """Publish today's cache; query only cities not yet attempted today."""
         if self._busy:
             self._again = True
             return
-        key = str(cfg.get("weather.api_key") or "").strip()      # 空 = 用 Open-Meteo
-        self._busy = True
-        run_bg(self._fetch_all, key, self.cities(), on_done=self._done, on_error=self._fail)
+        self._run_date = date.today().isoformat()
+        self._run_cities = self.cities()
+        self._cache = self._read_cache()
+        self._working = [None] * len(self._run_cities)
+        self._pending = []
 
-    def _params(self, key: str, c: dict) -> dict:
-        p = {"appid": key, "units": cfg.get("weather.units") or "metric", "lang": cfg.get("weather.lang") or "zh_cn"}
-        if c.get("lat") not in (None, "") and c.get("lon") not in (None, ""):
-            p["lat"], p["lon"] = c["lat"], c["lon"]
-        else:
-            p["q"] = c.get("q") or c.get("name")
-        return p
+        for index, city in enumerate(self._run_cities):
+            key = self._city_key(city)
+            record = self._cache.get(key) if isinstance(self._cache.get(key), dict) else {}
+            cached = record.get("data") if isinstance(record.get("data"), dict) else None
+            if record.get("attempt_date") == self._run_date:
+                if cached:
+                    row = dict(cached)
+                    if record.get("error"):
+                        row["error"] = f"今日查询失败，显示上次缓存：{record['error']}"
+                else:
+                    row = {"ok": False, "error": record.get("error") or "今日天气查询已尝试，暂无可用数据",
+                           "name": city.get("name") or city.get("q") or "?"}
+                row["index"] = index
+                self._working[index] = row
+                continue
 
-    def _geocode(self, name: str) -> dict | None:
-        """Open-Meteo 地理编码（支持中文城市名）-> {lat, lon, country} 或 None。"""
-        r = self._client.get(OM_GEO, params={"name": name, "count": 1, "language": "zh", "format": "json"})
-        r.raise_for_status()
-        res = (r.json().get("results") or [])
-        if not res:
-            return None
-        g = res[0]
-        return {"lat": g["latitude"], "lon": g["longitude"], "country": g.get("country_code", "")}
+            self._pending.append((index, city))
+            # Persist before sending: even if the app exits mid-request, it won't
+            # accidentally repeat a potentially billed request after restarting.
+            updated = dict(record)
+            updated.update(attempt_date=self._run_date, error="请求结果尚未缓存（今日不自动重试）")
+            self._cache[key] = updated
 
-    def _fetch_open_meteo(self, c: dict) -> dict:
-        lat, lon = c.get("lat"), c.get("lon")
-        if lat in (None, "") or lon in (None, ""):
-            g = self._geocode(c.get("q") or c.get("name") or "Shanghai")
-            if not g:
-                raise ValueError(f"找不到城市：{c.get('name')}")
-            lat, lon = g["lat"], g["lon"]
-        r = self._client.get(OM_API, params={
-            "latitude": lat, "longitude": lon, "timezone": "auto", "timeformat": "unixtime",
-            "wind_speed_unit": "ms", "forecast_days": 6,
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,"
-                       "cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,visibility",
-            "hourly": "temperature_2m,weather_code,precipitation_probability,is_day",
-            "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
-        })
-        r.raise_for_status()
-        d = parse_open_meteo(r.json())
-        d["name"] = d["city"] = c.get("name") or ""
-        return d
+        if not self._pending:
+            self.cities_data = [row for row in self._working if row is not None]
+            self._publish()
+            self._schedule_next_day()
+            return
 
-    def _fetch_one(self, key: str, c: dict) -> dict:
-        if not key:
-            return self._fetch_open_meteo(c)
-        p = self._params(key, c)
-        r = self._client.get(API + "/weather", params=p)
-        r.raise_for_status()
-        cur = r.json()
         try:
-            r2 = self._client.get(API + "/forecast", params=p)
-            r2.raise_for_status()
-            fc = r2.json()
-        except Exception:  # noqa: BLE001
-            fc = None
-        d = parse(cur, fc)
-        d["name"] = c.get("name") or d.get("city")
-        return d
+            self._write_cache(self._cache)
+        except OSError:
+            # Keep the app usable if its cache directory is read-only.
+            pass
+        self._busy = True
+        key = str(cfg.get("weather.uapi_key") or "").strip()
+        run_bg(self._fetch_all, key, self._pending, on_done=self._done, on_error=self._fail)
 
-    def _fetch_all(self, key: str, cities: list[dict]) -> list[dict]:
-        out = []
-        for i, c in enumerate(cities):
+    @staticmethod
+    def _lang() -> str:
+        return "en" if str(cfg.get("weather.lang") or "zh").strip().lower().startswith("en") else "zh"
+
+    def _fetch_one(self, key: str, city: dict) -> dict:
+        params = {"lang": self._lang(), "extended": "true", "forecast": "true",
+                  "hourly": "true", "indices": "true", "minutely": "true"}
+        if city.get("adcode"):
+            params["adcode"] = str(city["adcode"]).strip()
+        else:
+            name = str(city.get("q") or city.get("name") or "上海").strip()
+            if not name:
+                raise ValueError("城市名不能为空")
+            params["city"] = name
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        response = self._client.get(API, params=params, headers=headers)
+        response.raise_for_status()
+        data = parse_uapis_weather(response.json(), str(city.get("name") or city.get("q") or ""), params["lang"])
+        data["name"] = str(city.get("name") or data.get("city") or city.get("q") or "")
+        return data
+
+    def _fetch_all(self, key: str, pending: list[tuple[int, dict]]) -> list[dict]:
+        results = []
+        for index, city in pending:
             try:
-                d = self._fetch_one(key, c)
-            except Exception as e:  # noqa: BLE001
-                d = {"ok": False, "error": self._friendly(e), "name": c.get("name", "?")}
-            d["index"] = i
-            out.append(d)
-        return out
+                item = self._fetch_one(key, city)
+            except Exception as exc:  # noqa: BLE001
+                item = {"ok": False, "error": self._friendly(exc), "name": city.get("name", "?")}
+            item["index"] = index
+            results.append(item)
+        return results
 
-    def _done(self, data: list[dict]):
+    def _done(self, results: list[dict]):
         self._busy = False
-        old = {d.get("name"): d for d in self.cities_data if d.get("ok")}
-        merged = []
-        for d in data:
-            if not d.get("ok") and d.get("name") in old:      # 失败的城市保留上次数据
-                keep = dict(old[d["name"]])
-                keep.update(error=d.get("error"), index=d.get("index"))
-                merged.append(keep)
+        by_index = {item.get("index"): item for item in results}
+        pending_indices = {index for index, _ in self._pending}
+        for index, city in enumerate(self._run_cities):
+            if index not in pending_indices:
+                continue
+            key = self._city_key(city)
+            item = by_index.get(index) or {"ok": False, "error": "天气请求没有返回结果", "name": city.get("name", "?")}
+            if item.get("ok"):
+                cached_data = {field: value for field, value in item.items() if field not in ("index", "error")}
+                cached_data["error"] = ""
+                self._cache[key] = {"attempt_date": self._run_date, "data_date": self._run_date,
+                                    "error": "", "data": cached_data}
+                self._working[index] = item
             else:
-                merged.append(d)
-        self.cities_data = merged
+                record = dict(self._cache.get(key) or {})
+                record.update(attempt_date=self._run_date, error=item.get("error") or "天气请求失败")
+                self._cache[key] = record
+                previous = record.get("data")
+                if isinstance(previous, dict):
+                    row = dict(previous)
+                    row["error"] = f"今日查询失败，显示上次缓存：{record['error']}"
+                    row["index"] = index
+                    self._working[index] = row
+                else:
+                    self._working[index] = item
+
+        try:
+            self._write_cache(self._cache)
+        except OSError:
+            pass
+        self.cities_data = [row for row in self._working if row is not None]
         self._publish()
+        self._schedule_next_day()
         if self._again:
             self._again = False
             self.refresh()
 
     def _publish(self):
-        for i, d in enumerate(self.cities_data):
-            d["index"] = i
+        for index, item in enumerate(self.cities_data):
+            item["index"] = index
         self.cities_updated.emit(list(self.cities_data))
         if self.cities_data:
             self._emit_first(self.cities_data[0])
 
-    def _fail(self, e: Exception):
+    def _fail(self, exc: Exception):
         self._busy = False
-        d = dict(self.last) if self.last.get("ok") else {}
-        d.update({"ok": False, "error": self._friendly(e)})
-        self._emit_first(d)
+        message = self._friendly(exc)
+        for index, city in self._pending:
+            key = self._city_key(city)
+            record = dict(self._cache.get(key) or {})
+            record.update(attempt_date=self._run_date, error=message)
+            self._cache[key] = record
+            stale = record.get("data")
+            if isinstance(stale, dict):
+                row = dict(stale)
+                row["error"] = f"今日查询失败，显示上次缓存：{message}"
+                row["index"] = index
+                self._working[index] = row
+            else:
+                self._working[index] = {"ok": False, "error": message, "name": city.get("name", "?"), "index": index}
+        try:
+            self._write_cache(self._cache)
+        except OSError:
+            pass
+        self.cities_data = [row for row in self._working if row is not None]
+        self._publish()
+        self._schedule_next_day()
 
     @staticmethod
-    def _friendly(e: Exception) -> str:
-        if isinstance(e, httpx.HTTPStatusError):
-            code = e.response.status_code
-            return {401: "OpenWeather API Key 无效（新 Key 需等待最多 2 小时生效）",
-                    404: "找不到该城市", 429: "请求过于频繁"}.get(code, f"天气服务错误 HTTP {code}")
-        if isinstance(e, httpx.TimeoutException):
+    def _friendly(exc: Exception) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code
+            return {
+                401: "UAPIs Key 无效或已过期",
+                402: "UAPIs 免费额度或账户积分不足",
+                403: "UAPIs Key 无权调用此接口",
+                404: "找不到该城市",
+                429: "天气接口请求过于频繁或额度已用完",
+            }.get(code, f"天气服务错误 HTTP {code}")
+        if isinstance(exc, httpx.TimeoutException):
             return "天气请求超时"
-        if isinstance(e, httpx.TransportError):
-            return "无法连接天气服务"
-        if isinstance(e, ValueError) and str(e):
-            return str(e)
-        return f"天气解析失败：{str(e)[:60]}"
+        if isinstance(exc, httpx.TransportError):
+            return "无法连接 UAPIs 天气服务"
+        if isinstance(exc, ValueError) and str(exc):
+            return str(exc)
+        return f"天气解析失败：{str(exc)[:60]}"
 
-    def _emit_first(self, d: dict):
-        if d.get("ok"):
-            self.last = d
-        self.updated.emit(d)
+    def _emit_first(self, item: dict):
+        if item.get("ok"):
+            self.last = item
+        self.updated.emit(item)
