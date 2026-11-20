@@ -92,6 +92,19 @@ class Hoverable(QtWidgets.QWidget, Themed):
         return 1.0 - 0.06 * self._press.x
 
 
+class ChoiceBox(QtWidgets.QComboBox):
+    """绘制独立窗口用的下拉箭头，避免系统子控件破坏圆角。"""
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setPen(QtGui.QPen(self.palette().buttonText().color(), 1.25))
+        x, y = self.width() - 13, self.height() / 2
+        p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(x - 3.5, y - 2), QtCore.QPointF(x, y + 1.5),
+                                       QtCore.QPointF(x + 3.5, y - 2)]))
+        p.end()
+
+
 class IconButton(Hoverable):
     """圆形图标按钮：悬停时出现半透明白底。"""
     def __init__(self, glyph: str, size: int = 32, icon_px: int = 15, tip: str = "", parent=None,
@@ -101,6 +114,7 @@ class IconButton(Hoverable):
         self.icon_px = icon_px
         self.filled = filled
         self.active = False
+        self._attention = False
         self.color: QtGui.QColor | None = None
         self.setFixedSize(size, size)
         if tip:
@@ -114,6 +128,12 @@ class IconButton(Hoverable):
     def set_active(self, on: bool):
         if on != self.active:
             self.active = on
+            self.update()
+
+    def set_attention(self, on: bool):
+        """角标只表示有待处理内容，不改变按钮的选中状态。"""
+        if self._attention != on:
+            self._attention = on
             self.update()
 
     def paintEvent(self, e):
@@ -140,6 +160,10 @@ class IconButton(Hoverable):
             fg = QtGui.QColor("white")
         p.setPen(fg)
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.glyph)
+        if self._attention:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor("#ff453a"))
+            p.drawEllipse(QtCore.QPointF(r.right() - 5, r.top() + 5), 2.7, 2.7)
 
 
 class PillButton(Hoverable):
