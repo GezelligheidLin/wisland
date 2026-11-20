@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
-"""消息提醒：QQ / 微信 / 邮件。
+"""消息提醒：QQ / 微信 / 钉钉 / 邮件。
 
 三个来源：
   A. 轮询 Windows 通知数据库 wpndatabase.db（只读），新出现的 toast 按 PrimaryId 前缀映射。
   B. UI 收到 HSHELL_FLASH 时调用 on_flash(hwnd)，按进程名映射（8 秒内同类去重）。
   C. 邮件兜底：每 20 秒检查 Thunderbird 各账户 INBOX mbox 文件是否变大。
 
-隐私：不对外暴露消息正文；邮件连发件人都不带。QQ/微信 仅可选带 "sender"（toast 第一行文字）。
+QQ / 微信 / 钉钉展示系统通知提供的发送者与摘要，仅保留在内存中；邮件不展示发件人或正文。
 """
 from __future__ import annotations
 
 import configparser
 import ctypes
 import os
-import re
 import sqlite3
 import threading
 import time
+import xml.etree.ElementTree as ET
 from ctypes import wintypes
 from pathlib import Path
 
@@ -45,22 +45,36 @@ def filetime_to_epoch(ft) -> float:
     return (ft - _FILETIME_EPOCH_DIFF) / 1e7
 
 
-_TEXT_RE = re.compile(r"<text\b[^>]*>(.*?)</text>", re.S | re.I)
+def toast_texts(payload) -> list[str]:
+    """提取通知 XML 的非空文本，解码转义并合并换行；格式无效时返回空列表。"""
+    try:
+        root = ET.fromstring(payload or "")
+        texts = []
+        for node in root.iter():
+            if node.tag.rsplit("}", 1)[-1].lower() == "text":
+                text = " ".join("".join(node.itertext()).split())
+                if text:
+                    texts.append(text[:240])
+        return texts
+    except (ET.ParseError, TypeError, ValueError):
+        return []
 
 
 def toast_first_text(payload) -> str:
-    """toast XML 的第一个 <text>（通常是发送者 / 群名）。解析失败返回空串。"""
-    try:
-        s = payload.decode("utf-8", "replace") if isinstance(payload, (bytes, bytearray)) else str(payload or "")
-        m = _TEXT_RE.search(s)
-        if not m:
-            return ""
-        t = re.sub(r"<[^>]+>", "", m.group(1))
-        t = (t.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
-             .replace("&apos;", "'").replace("&amp;", "&")).strip()
-        return t[:40]
-    except Exception:  # noqa: BLE001
-        return ""
+    """返回通知首行（最多 40 字），用于不暴露正文的诊断统计。"""
+    texts = toast_texts(payload)
+    return texts[0][:40] if texts else ""
+
+
+def notification_summary(notification: dict) -> str:
+    """生成提醒和历史共用的摘要；缺少正文时回退为发送者或通用提示。"""
+    if notification.get("kind") == "mail":
+        return "新邮件"
+    sender = notification.get("sender")
+    content = notification.get("content")
+    if content:
+        return f"{sender}：{content}" if sender else content
+    return f"{sender} 发来消息" if sender else "新消息"
 
 
 # ---------------- hwnd -> exe ----------------
@@ -69,6 +83,7 @@ _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
 _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.GetForegroundWindow.restype = wintypes.HWND
 _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _kernel32.OpenProcess.restype = wintypes.HANDLE
 _kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
@@ -150,8 +165,9 @@ def inbox_files(profile: Path) -> list[Path]:
 # ---------------- service ----------------
 
 class NotifyService(QtCore.QObject):
-    notified = QtCore.Signal(dict)        # {kind, name, source:'toast'|'flash'|'file', time, [sender]}
+    notified = QtCore.Signal(dict)        # {kind, name, source:'toast'|'flash'|'file', time, [sender], [content]}
     counts_changed = QtCore.Signal(dict)  # {kind: n}
+    open_failed = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -167,6 +183,10 @@ class NotifyService(QtCore.QObject):
         self._inbox_state: dict[str, tuple[int, float]] | None = None
         self._profile: Path | None = None
         self._running = False
+        self._foreground_kind = ""
+        self._foreground_since = 0.0
+        self._read_at: dict[str, float] = {}
+        self._foreground_timer = QtCore.QTimer(self, interval=500, timeout=self._sync_foreground)
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(POLL_MS)
@@ -179,6 +199,7 @@ class NotifyService(QtCore.QObject):
     def start(self):
         self._running = True
         self._timer.start()
+        self._foreground_timer.start()
         self._mail_timer.start()
         self._tick()
         self._mail_tick()
@@ -186,24 +207,58 @@ class NotifyService(QtCore.QObject):
     def stop(self):
         self._running = False
         self._timer.stop()
+        self._foreground_timer.stop()
         self._mail_timer.stop()
 
     # ---------- public ----------
     def clear(self, kind: str):
-        if self.counts.get(kind):
-            self.counts[kind] = 0
+        """清除该应用的计数和提醒记录，同时忽略延迟到达的旧通知。"""
+        self._read_at[kind] = time.time()
+        changed = bool(self.counts.get(kind)) or any(d.get("kind") == kind for d in self.history)
+        self.counts[kind] = 0
+        self.history[:] = [d for d in self.history if d.get("kind") != kind]
+        if changed:
             self.counts_changed.emit(dict(self.counts))
 
-    def open(self, kind: str):
-        path = cfg.get(f"notify.open.{kind}") or next(
-            (exe for exe, m in (cfg.get("notify.flash_processes") or {}).items() if m.get("kind") == kind), "")
-        if path:
-            opener = getattr(self, "opener", None)     # app.py 注入：已打开则切换窗口
-            if opener is not None:
-                opener(expand(path))
-            else:
-                launch(expand(path))
-        self.clear(kind)
+    def open(self, kind: str) -> bool:
+        """打开或切换应用；成功后清除提醒，失败时保留并给出提示。"""
+        processes = cfg.get("notify.flash_processes") or {}
+        names = [exe for exe, mapping in processes.items() if mapping.get("kind") == kind]
+        path = expand(cfg.get(f"notify.open.{kind}") or "")
+        if not path or not os.path.isfile(path):
+            import psutil
+            for process in psutil.process_iter(["name"]):
+                try:
+                    if (process.info["name"] or "").lower() in names:
+                        path = process.exe()
+                        break
+                except (psutil.Error, OSError):
+                    continue
+        path = path or next(iter(names), "")
+        try:
+            opener = getattr(self, "opener", None)
+            result = opener(path) if opener and path else launch(path) if path else False
+            success = result is True or result in ("focused", "launched")
+        except Exception:
+            success = False
+        if success:
+            self.clear(kind)
+        else:
+            name = next((m.get("name", kind) for m in processes.values() if m.get("kind") == kind), kind)
+            self.open_failed.emit(f"无法打开{name}，请检查应用的显示窗口快捷键或 notify.open.{kind} 路径")
+        return success
+
+    def _sync_foreground(self):
+        """将目标软件在前台持续停留一秒视为已查看，清除其本地提醒。"""
+        exe = exe_of_hwnd(_user32.GetForegroundWindow())
+        mapping = (cfg.get("notify.flash_processes") or {}).get(exe) or {}
+        kind = mapping.get("kind", "")
+        now = time.monotonic()
+        if kind != self._foreground_kind:
+            self._foreground_kind = kind
+            self._foreground_since = now
+        if kind and now - self._foreground_since >= 1.0:
+            self.clear(kind)
 
     def on_flash(self, hwnd: int):
         try:
@@ -224,6 +279,8 @@ class NotifyService(QtCore.QObject):
     # ---------- internal ----------
     def _emit(self, d: dict):
         kind = d["kind"]
+        if d.get("source") == "toast" and d.get("time", time.time()) <= self._read_at.get(kind, 0):
+            return
         self._last_by_kind[kind] = time.time()
         if kind == "mail":
             d.pop("sender", None)
@@ -299,10 +356,13 @@ class NotifyService(QtCore.QObject):
                 kind = m.get("kind", "other")
                 d = {"kind": kind, "name": m.get("name", kind), "source": "toast",
                      "time": filetime_to_epoch(arrival)}
-                if kind in ("qq", "wechat"):
-                    s = toast_first_text(payload)
-                    if s:
-                        d["sender"] = s
+                if kind in ("qq", "wechat", "dingtalk"):
+                    texts = toast_texts(payload)
+                    if len(texts) > 1:
+                        d["sender"] = texts[0][:40]
+                        d["content"] = " ".join(texts[1:])[:240]
+                    elif texts:
+                        d["content"] = texts[0]
                 self._emit(d)
             except Exception:  # noqa: BLE001
                 continue

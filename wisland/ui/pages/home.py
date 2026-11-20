@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""主页（正在播放 + 快捷操作 + 自定义启动器）与消息页（QQ / 微信 / 邮件提醒）。"""
+"""主页（正在播放 + 快捷操作 + 自定义启动器）与消息页（QQ / 微信 / 钉钉 / 邮件提醒）。"""
 from __future__ import annotations
 
 import os
@@ -9,6 +9,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from ...core.bg import launch
 from ...core.config import cfg, expand
+from ...services.notify import notification_summary
 from ..anim import Spring, clamp
 from ..theme import KIND_COLORS, G, W, icon_font, theme, ui_font
 from ..widgets import (Card, Hoverable, IconButton, Label, PillButton, ScrollArea, Themed, fmt_time, hbox,
@@ -566,15 +567,39 @@ class AppTile(Hoverable):
 
 
 class HistoryList(QtWidgets.QWidget, Themed):
+    opened = QtCore.Signal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows: list[dict] = []
+        self._pressed_row = -1
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hook_theme()
 
     def set_rows(self, rows):
+        self._pressed_row = -1
         self.rows = rows[:30]
         self.setFixedHeight(max(30, len(self.rows) * 30))
         self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._pressed_row = int(event.position().y() // 30)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """点击同一条提醒时打开对应应用；没有会话定位数据时不猜测聊天目标。"""
+        row = int(event.position().y() // 30)
+        pressed = self._pressed_row
+        self._pressed_row = -1
+        if event.button() == Qt.MouseButton.LeftButton and row == pressed \
+                and self.rect().contains(event.position().toPoint()) and 0 <= row < len(self.rows):
+            self.opened.emit(self.rows[row]["kind"])
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, e):
         p = painter(self)
@@ -592,8 +617,7 @@ class HistoryList(QtWidgets.QWidget, Themed):
             p.setFont(ui_font(12.5, W.Medium))
             p.setPen(theme.text())
             p.drawText(QtCore.QRectF(24, y, 80, 30), Qt.AlignmentFlag.AlignVCenter, r.get("name", ""))
-            kind = r.get("kind")
-            desc = "新邮件" if kind == "mail" else (f"{r['sender']} 发来消息" if r.get("sender") else "新消息")
+            desc = notification_summary(r)
             p.setFont(ui_font(12.5))
             p.setPen(theme.text2())
             p.drawText(QtCore.QRectF(100, y, self.width() - 170, 30), Qt.AlignmentFlag.AlignVCenter,
@@ -612,11 +636,13 @@ class MessagesPage(Page):
         self.tiles = {
             "qq": AppTile("qq", "QQ", G.CHAT),
             "wechat": AppTile("wechat", "微信", G.MESSAGE),
+            "dingtalk": AppTile("dingtalk", "钉钉", G.MESSAGE),
             "mail": AppTile("mail", "邮件", G.MAIL),
         }
         for k, t in self.tiles.items():
             t.clicked.connect(lambda k=k: self._open(k))
         self.hist = HistoryList()
+        self.hist.opened.connect(self._open)
         sc = ScrollArea()
         lay = QtWidgets.QVBoxLayout(sc.inner)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -628,12 +654,12 @@ class MessagesPage(Page):
         self.setLayout(vbox(hbox(*self.tiles.values(), spacing=8), head, (sc, 1), spacing=8))
 
     def _open(self, kind):
-        self.ctx.notify.open(kind)
-        if self.island:
+        opened = self.ctx.notify.open(kind)
+        if opened and self.island:
             self.island.collapse()
 
     def _clear_all(self):
-        for k in list(self.ctx.notify.counts):
+        for k in set(self.ctx.notify.counts) | {d["kind"] for d in self.ctx.notify.history}:
             self.ctx.notify.clear(k)
 
     def refresh(self):
