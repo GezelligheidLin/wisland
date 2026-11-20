@@ -28,6 +28,8 @@ DEFAULTS: dict = {
         "blur_fps": 8,
         "scale": 1.0,
         "default_tab": "home",
+        "visible_tabs": ["home", "msg", "stock", "weather", "ctl", "clip", "trans", "todo"],
+        "tabs_version": 1,         # 1 = 待办已作为独立标签加入
         "expand_mode": "hover",     # hover = 悬停展开 / always = 常驻展开 / never = 保持收起
         "pinned": False,            # 旧版"保持展开"（兼容）
         "compact_view": "clock",    # 收起态视图：clock / pet / music（滚轮切换）
@@ -36,9 +38,12 @@ DEFAULTS: dict = {
     },
     "hotkeys": {
         "toggle": "Ctrl+Alt+I",
+        "edge_hide": "Ctrl+Alt+H",
         "translate": "Ctrl+Alt+J",
         "clipboard": "Ctrl+Alt+V",
+        "todo_add": "",              # 默认不占用热键
     },
+    "todo": {"popup": True},
     "media": {
         "auto_show": True,           # 开始播放时收起态自动切到音乐（暂停 8 秒后切回）
         "lyrics": True,              # 收起态显示歌词（网易云公开歌词接口）
@@ -51,18 +56,21 @@ DEFAULTS: dict = {
             "QQ": {"name": "QQ", "kind": "qq"},
             "ThunderbirdToast": {"name": "邮件", "kind": "mail"},
             "Weixin": {"name": "微信", "kind": "wechat"},
+            "DingTalk": {"name": "钉钉", "kind": "dingtalk"},
         },
         # 任务栏闪烁（FlashWindow）的进程 -> 显示名 / 类型
         "flash_processes": {
             "weixin.exe": {"name": "微信", "kind": "wechat"},
             "wechat.exe": {"name": "微信", "kind": "wechat"},
             "qq.exe": {"name": "QQ", "kind": "qq"},
+            "dingtalk.exe": {"name": "钉钉", "kind": "dingtalk"},
             "thunderbird.exe": {"name": "邮件", "kind": "mail"},
         },
         "open": {
             "qq": "",          # 例：C:/Program Files/Tencent/QQNT/QQ.exe
             "wechat": "",      # 例：C:/Program Files/Tencent/Weixin/Weixin.exe
             "mail": "",        # 例：C:/Program Files/Mozilla Thunderbird/thunderbird.exe
+            "dingtalk": "",    # 可配置本机 DingTalk.exe 路径，留空时按进程名打开
         },
     },
     "stocks": {
@@ -73,14 +81,13 @@ DEFAULTS: dict = {
         "alerts": {},                # {"sh688256": {"above": 1500, "below": 1200}}
     },
     "weather": {
-        "api_key": "",         # 留空 = 使用 Open-Meteo（免费、无需 Key）；填 OpenWeather Key 则改用 OpenWeather
+        "uapi_key": "",        # UAPIs 天气 API Key；留空使用免费调用额度
         "city": "上海",
         "lat": None,
         "lon": None,
         "units": "metric",
         "lang": "zh_cn",
-        "interval_min": 15,
-        "cities": [],          # [{"name": "上海", "lat": 31.23, "lon": 121.47}]，第一个显示在收起态
+        "cities": [],          # [{"name": "上海"}] 或 [{"name": "北京", "adcode": "110000"}]，第一个显示在收起态
     },
     "brightness": {"twinkle": ""},   # 留空 = 直接用 DDC/CI / WMI（便携版 Twinkle 每次调用都会弹"安装中"）
     "clash": {
@@ -162,6 +169,13 @@ class Config(QtCore.QObject):
                 print("config.json 解析失败，使用默认值：", e)
         with self._lock:
             self.data = _merge(DEFAULTS, user)
+            # 老版仅持久化可见标签。首次加入待办时尊重原有隐藏项；下次保存后不再自动加入。
+            old_island = user.get("island")
+            if isinstance(old_island, dict) and not old_island.get("tabs_version"):
+                tabs = old_island.get("visible_tabs")
+                if (isinstance(tabs, list) and "todo" not in tabs
+                        and any(key in tabs for key in DEFAULTS["island"]["visible_tabs"][:-1])):
+                    self.data["island"]["visible_tabs"] = [*tabs, "todo"]
         if not CONFIG_PATH.exists():
             self.save()
 

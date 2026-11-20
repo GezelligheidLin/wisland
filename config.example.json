@@ -11,6 +11,8 @@
     "blur_fps": 8,
     "scale": 1.0,
     "default_tab": "home",
+    "visible_tabs": ["home", "msg", "stock", "weather", "ctl", "clip", "trans", "todo"],
+    "tabs_version": 1,
     "expand_mode": "hover",
     "pinned": false,
     "compact_view": "clock",
@@ -19,9 +21,12 @@
   },
   "hotkeys": {
     "toggle": "Ctrl+Alt+I",
+    "edge_hide": "Ctrl+Alt+H",
     "translate": "Ctrl+Alt+J",
-    "clipboard": "Ctrl+Alt+V"
+    "clipboard": "Ctrl+Alt+V",
+    "todo_add": ""
   },
+  "todo": {"popup": true},
   "media": {
     "auto_show": true,
     "lyrics": true,
@@ -37,6 +42,10 @@
   },
   "notify": {
     "toast_apps": {
+      "DingTalk": {
+        "name": "钉钉",
+        "kind": "dingtalk"
+      },
       "QQ": {
         "name": "QQ",
         "kind": "qq"
@@ -51,6 +60,10 @@
       }
     },
     "flash_processes": {
+      "dingtalk.exe": {
+        "name": "钉钉",
+        "kind": "dingtalk"
+      },
       "weixin.exe": {
         "name": "微信",
         "kind": "wechat"
@@ -69,6 +82,7 @@
       }
     },
     "open": {
+      "dingtalk": "",
       "qq": "",
       "wechat": "",
       "mail": ""
@@ -89,13 +103,12 @@
     "alerts": {}
   },
   "weather": {
-    "api_key": "",
+    "uapi_key": "",
     "city": "上海",
     "lat": null,
     "lon": null,
     "units": "metric",
     "lang": "zh_cn",
-    "interval_min": 15,
     "cities": []
   },
   "brightness": {
