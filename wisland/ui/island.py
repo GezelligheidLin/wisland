@@ -27,7 +27,7 @@ from .compact import CompactView
 from .glass import Backdrop, exclude_from_capture
 from .nav import NavBar
 from .shape import body_path, body_points, deform, drip_path, edge_corners, neck_path, poly_path
-from .theme import G, theme
+from .theme import G, THEME_EASING, THEME_TRANSITION_MS, theme
 
 _DBG = bool(os.environ.get("WISLAND_DEBUG"))
 
@@ -62,20 +62,26 @@ user32.RegisterWindowMessageW.restype = wintypes.UINT
 
 
 def parse_hotkey(s: str) -> tuple[int, int] | None:
-    parts = [x.strip().lower() for x in (s or "").split("+") if x.strip()]
-    if not parts:
+    """将配置字符串转换为 Win32 修饰键和虚拟键；每个组合只能有一个主键。"""
+    if not isinstance(s, str):
         return None
-    mods = 0
-    vk = 0
-    for x in parts:
-        if x in MOD:
-            mods |= MOD[x]
-        elif len(x) == 1 and x.isalnum():
-            vk = ord(x.upper())
-        elif x.startswith("f") and x[1:].isdigit():
-            vk = 0x70 + int(x[1:]) - 1
-        elif x == "space":
+    mods = vk = 0
+    for part in (x.strip().lower() for x in s.split("+")):
+        if part in MOD and not mods & MOD[part]:
+            mods |= MOD[part]
+        elif vk:
+            return None
+        elif len(part) == 1 and part.isascii() and part.isalnum():
+            vk = ord(part.upper())
+        elif part == "space":
             vk = 0x20
+        elif 2 <= len(part) <= 3 and part.startswith("f") and part[1:].isascii() and part[1:].isdigit():
+            number = int(part[1:])
+            if not 1 <= number <= 24:
+                return None
+            vk = 0x70 + number - 1
+        else:
+            return None
     return (mods | MOD_NOREPEAT, vk) if vk else None
 
 
@@ -117,7 +123,7 @@ class _RightClickHook:
                 sg = isl.scr.geometry()
                 lx = sg.x() + (info.pt.x - sg.x()) / dpr
                 ly = sg.y() + (info.pt.y - sg.y()) / dpr
-                if isl.isVisible() and not isl.expanded and isl._inside(QtCore.QPoint(round(lx), round(ly))):
+                if isl.isVisible() and not isl.expanded and not isl.edge_hidden and isl._inside(QtCore.QPoint(round(lx), round(ly))):
                     delta = ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value
                     QtCore.QTimer.singleShot(0, lambda d=delta: isl.wheel_compact.emit(1 if d > 0 else -1))
                     return 1
@@ -238,6 +244,13 @@ class Island(QtWidgets.QWidget):
         self.scr: QtGui.QScreen = self._pick_screen()
         self.mode = "anchored"
         self.expanded = False
+        self.edge_hidden = False
+        self.edge_hide_a = Spring(0, 360, 1.0, 0.002)
+        self.edge_hover_a = Spring(0, 420, 0.75, 0.002)
+        self.edge_progress = Spring(0, 650, 1.0, 0.002)
+        self._edge_hover_since = None
+        self._edge_reveal_wait_leave = False
+        self._hide_after_snap = False
         cw, ch = self.compact.size_hint()
         self.sw = Spring(cw, 300, 0.62, 0.2)
         self.sh = Spring(ch, 300, 0.62, 0.2)
@@ -271,9 +284,11 @@ class Island(QtWidgets.QWidget):
         self._poke_pt = QtCore.QPointF()
         self._poke_sm = QtCore.QPointF()          # 平滑后的按压位置（凹陷跟着鼠标滑动）
         self._floor_on: dict = {}
-        self._bd_shown = None
+        self._bd_target = None
         self._bd_prev = None
         self._bd_fade_t0 = 0.0
+        self._bd_fade_duration = THEME_TRANSITION_MS / 1000
+        self._bd_fade_from = 0.0
         self._shell_msg = 0
         self._dirty = QtCore.QRect()
 
@@ -313,6 +328,7 @@ class Island(QtWidgets.QWidget):
         theme.changed.connect(self.update)
 
         self._place_initial()
+        self.apply_visible_tabs()
 
     # ================================================================ 屏幕 / 位置
     def _pick_screen(self) -> QtGui.QScreen:
@@ -358,12 +374,58 @@ class Island(QtWidgets.QWidget):
         self._update_geometry(force=True)
 
     # ================================================================ 展开 / 收起
+    def toggle_edge_hidden(self):
+        """切换贴边细线；拖动中先吸附再隐藏，重复按键可取消。"""
+        if self._hide_after_snap:
+            self._hide_after_snap = False
+        elif self.mode != "anchored":
+            self._hide_after_snap = True
+            if self.mode == "drag":
+                self._end_drag()
+        else:
+            self.set_edge_hidden(not self.edge_hidden)
+
+    def set_edge_hidden(self, hidden: bool):
+        """从当前动画位置变形为细线或胶囊，保留展开方式和穿透配置。"""
+        if hidden == self.edge_hidden or self.mode != "anchored":
+            return
+        self.edge_hidden = hidden
+        self._edge_hover_since = None
+        self._hover_since = self._out_since = None
+        self.edge_hover_a.to(0)
+        self.edge_progress.to(0)
+        self._edge_reveal_wait_leave = not hidden
+        self._click_timer.stop()
+        self._press = None
+        self.poke.to(0, 360, 1.0)
+        self._floor_t.clear()
+        self._floor_on.clear()
+        if hidden and self.expanded:
+            self.expanded = False
+            self.content_a.to(0, 900, 1.0)
+            self.content.hide()
+            self.veil.hide()
+            self.release_focus()
+            self.locks.discard("pin")
+            self.pages[self.stack.currentIndex()].on_hide()
+            self.expanded_changed.emit(False)
+        self.edge_hide_a.to(1 if hidden else 0)
+        self.compact_a.to(0 if hidden else 1, 500, 1.0)
+        w, h = self.target_size()
+        # 临界阻尼避免细线尺寸过冲；恢复时保留轻微弹性。
+        self.sw.to(w, 360, 1.0 if hidden else 0.8)
+        self.sh.to(h, 360, 1.0 if hidden else 0.8)
+        self._apply_passthrough()
+        self._kick()
+
     def expanded_size(self) -> tuple[float, float]:
         """打开时的尺寸（按上次停留的页面的高度）。"""
         pg = self.pages[self.stack.currentIndex()]
         return EXP_W, PAD - 2 + NAV_H + 8 + pg.preferred_height() + PAD
 
     def target_size(self) -> tuple[float, float]:
+        if self.edge_hidden:
+            return (72.0, 6.0) if self.edge in ("top", "bottom") else (6.0, 72.0)
         if self.expanded:
             pg = self.pages[self.stack.currentIndex()]
             h = PAD - 2 + NAV_H + 8 + pg.preferred_height() + PAD
@@ -373,6 +435,8 @@ class Island(QtWidgets.QWidget):
     def expand(self, page: str | None = None):
         if self.mode != "anchored" or self._fs_hidden:
             return
+        if self.edge_hidden:
+            self.set_edge_hidden(False)
         if not self.expanded:
             # 打开时停留在上次收起前的页面（热键 / 托盘等指定了页面的除外）
             self.show_page(page or self._page_key)
@@ -420,6 +484,9 @@ class Island(QtWidgets.QWidget):
         self._kick()
 
     def toggle(self, page: str | None = None):
+        if self.edge_hidden and page is None:
+            self.set_edge_hidden(False)
+            return
         if self.expanded and (page is None or page == self._page_key):
             if self.pinned():
                 self.set_pinned(False)
@@ -428,12 +495,22 @@ class Island(QtWidgets.QWidget):
             self.expand(page)
             self.locks.add("pin")
 
+    def apply_visible_tabs(self):
+        """应用标签可见性；无有效配置时恢复全部，隐藏当前页时切到首个可见页。"""
+        selected = cfg.get("island.visible_tabs")
+        visible = [pg for pg in self.pages if isinstance(selected, list) and pg.key in selected]
+        if not visible:
+            visible = self.pages
+        self.nav.set_items([(pg.key, pg.glyph, pg.title) for pg in visible])
+        key = self._page_key if self._page_key in self.nav.keys() else visible[0].key
+        self.show_page(key)
+
     def show_page(self, key: str):
         keys = self.nav.keys()
         if key not in keys:
             return
         old = self.stack.currentIndex()
-        i = keys.index(key)
+        i = next(i for i, pg in enumerate(self.pages) if pg.key == key)
         self._page_key = key
         self.nav.set_current(key)
         if i != old:
@@ -470,6 +547,8 @@ class Island(QtWidgets.QWidget):
 
     # ================================================================ 拖动
     def begin_drag(self, gpos: QtCore.QPoint | None = None):
+        if self.edge_hidden:
+            return
         if self.mode == "drag" or self.passthrough():
             return
         gpos = QtCore.QPointF(gpos or QtGui.QCursor.pos())
@@ -555,10 +634,13 @@ class Island(QtWidgets.QWidget):
     def _needs_frames(self) -> bool:
         if self.mode != "anchored" or self.drips or self._bd_prev is not None:
             return True
-        for s in (self.sw, self.sh, self.content_a, self.compact_a, self.neck_s):
+        for s in (self.sw, self.sh, self.content_a, self.compact_a, self.neck_s,
+                  self.edge_hide_a, self.edge_hover_a, self.edge_progress):
             if not s.rest:
                 return True
-        if not self.expanded and not self._fs_hidden:
+        if self.edge_hidden and self._edge_hover_since is not None:
+            return True
+        if not self.expanded and not self._fs_hidden and not self.edge_hidden:
             return True                  # 收起态：常态动画（圆角呼吸 + 边缘流光）持续运行
         return False
 
@@ -575,12 +657,12 @@ class Island(QtWidgets.QWidget):
                 self.fx.to(cp.x())
                 self.fy.to(cp.y())
         if not self.expanded:
-            cw, ch = self.compact.size_hint()
+            cw, ch = self.target_size()
             if abs(self.sw.target - cw) > 0.5 or abs(self.sh.target - ch) > 0.5:
                 if self.content_a.x < 0.12:
                     self.sw.to(cw, 460, 0.64)
                     self.sh.to(ch, 460, 0.64)
-                    if self.compact_a.target < 1:
+                    if self.compact_a.target < 1 and not self.edge_hidden:
                         self.compact_a.to(1, 420, 1.0)
         else:
             w, h = self.target_size()
@@ -597,7 +679,8 @@ class Island(QtWidgets.QWidget):
                 self.veil.raise_()
 
         for s in (self.sw, self.sh, self.fx, self.fy, self.along, self.gap, self.neck_s,
-                  self.content_a, self.compact_a, self.poke):
+                  self.content_a, self.compact_a, self.poke, self.edge_hide_a,
+                  self.edge_hover_a, self.edge_progress):
             s.step(dt)
         if abs(self.poke.x) > 0.01 or self.poke.target:
             if self._poke_sm.isNull():
@@ -629,8 +712,8 @@ class Island(QtWidgets.QWidget):
         if self.mode == "snap" and self.along.rest and self.gap.rest:
             self.mode = "anchored"
             self._place_nav()
-            if self.pinned():
-                QtCore.QTimer.singleShot(80, self.expand)
+            if self.pinned() and not self._hide_after_snap:
+                QtCore.QTimer.singleShot(80, lambda: self.expand() if not self.edge_hidden else None)
             R = self._avail()
             horiz = self.edge in ("top", "bottom")
             self.pos_frac = clamp(((self.along.x - R.left()) / R.width()) if horiz
@@ -641,6 +724,9 @@ class Island(QtWidgets.QWidget):
             cfg.set("island.screen", screens.index(self.scr) if self.scr in screens else 0)
             self.neck_edge = self.edge
             self.neck_s.to(1)
+            if self._hide_after_snap:
+                self._hide_after_snap = False
+                self.set_edge_hidden(True)
 
         # 收起时：内容淡出完成后隐藏
         if not self.expanded and self.content.isVisible() and self.content_a.x < 0.05:
@@ -684,7 +770,7 @@ class Island(QtWidgets.QWidget):
                 "left": body.left() - line, "right": line - body.right()}[edge]
 
     def _update_geometry(self, force: bool = False):
-        w, h = max(40.0, self.sw.x), max(24.0, self.sh.x)
+        w, h = max(3.0, self.sw.x), max(3.0, self.sh.x)
         vx = vy = 0.0
         squash = 0.0
         if self.mode == "anchored":
@@ -696,7 +782,7 @@ class Island(QtWidgets.QWidget):
                 else:
                     w, h = w * (1 - 0.16 * pk), h * (1 + 0.05 * pk)
             a = self._anchor_along(w, h)
-            c = self._center_on_edge(self.edge, a, 0, w, h)
+            c = self._center_on_edge(self.edge, a, 2.0 * clamp(self.edge_hide_a.x, 0, 1), w, h)
             self.neck_edge = self.edge
         elif self.mode == "snap":
             g = self.gap.x
@@ -766,10 +852,10 @@ class Island(QtWidgets.QWidget):
         if self.expanded or h > 60:
             base_r = min(30.0, h / 2, w / 2)
         t_now = time.perf_counter() - self._t0
-        fillet = FILLET
+        fillet = FILLET * (1.0 - clamp(self.edge_hide_a.x, 0, 1))
         if self.mode == "anchored" and not self.expanded:
             fillet *= 1.0 + 0.07 * math.sin(t_now * 1.7)            # 常态：圆角轻微"呼吸"
-        fillet += min(12.0, (abs(self.sw.v) + abs(self.sh.v)) * 0.012)   # 形变越快，液面拉得越开
+        fillet += min(12.0, (abs(self.sw.v) + abs(self.sh.v)) * 0.012) * (1.0 - clamp(self.edge_hide_a.x, 0, 1))
 
         path = QtGui.QPainterPath()
         neck = None
@@ -781,18 +867,22 @@ class Island(QtWidgets.QWidget):
             t = clamp(gap_n / BREAK, 0, 1)
             corner_r = base_r * smooth(t * 1.8)
             corner_r = lerp(base_r, corner_r, self.neck_s.x)
+            corner_r = lerp(corner_r, base_r, clamp(self.edge_hide_a.x, 0, 1))
             radii = tuple(corner_r if flag else base_r for flag in edge_corners(ne))
             horiz = ne in ("top", "bottom")
             along_c = body.center().x() if horiz else body.center().y()
             length = w if horiz else h
             lline = line + (-wy if horiz else -wx)
+            # 贴边隐藏时本体只离开边缘 2px，液桥必须在间隙拉开之前就化掉：
+            # 若按 1-a 慢慢淡，胶囊已经缩成细线、液桥还剩一根窄颈，看起来像细线挂在边缘的"点上"。
+            neck_strength = self.neck_s.x * (1.0 - clamp(self.edge_hide_a.x / 0.45, 0.0, 1.0))
             neck = neck_path(ne, lline, along_c + (-wx if horiz else -wy), length, gap_n, t,
-                             self.neck_s.x, fillet, corner_r)
+                             neck_strength, fillet, corner_r)
         else:
             radii = (base_r,) * 4
 
         speed = math.hypot(vx, vy)
-        playing_wave = (self.mode == "anchored" and not self.expanded and self.compact.mode() == "media"
+        playing_wave = (self.mode == "anchored" and not self.expanded and not self.edge_hidden and self.compact.mode() == "media"
                         and self.compact.playing())
         poking = self.mode == "anchored" and abs(self.poke.x) > 0.01
         if speed > 30 or playing_wave or poking:
@@ -939,30 +1029,93 @@ class Island(QtWidgets.QWidget):
             interval = 1 / 40
         else:
             fps = max(2.0, float(cfg.get("island.blur_fps", 10)))
-            interval = 1 / (fps if self.expanded else min(fps, 3.0))   # 收起静止时身后画面变化不敏感
+            interval = 1 / (fps if self.expanded or theme.mode == "auto" else min(fps, 3.0))
             if self.capture_visible():
                 # 参与截图时，每次取背景都要临时把自己排除约 17ms：静止时降低频率，
                 # 让截图 / 录屏几乎总能拍到灵动岛（动画、拖动时仍高频刷新）
-                interval = 1 / (1.5 if self.expanded else 1.0)
+                interval = 1 / (min(fps, 8.0) if theme.mode == "auto" else (1.5 if self.expanded else 1.0))
         need = self.path.boundingRect().toAlignedRect().translated(self._win_origin).intersected(self.scr.geometry())
         self.backdrop.request(self.scr, g, interval, urgent=not self.backdrop.covers(need))
 
     def _on_backdrop(self, changed: bool):
+        """新截图从当前混合画面接续；同一主题内的连续采样不延后动画终点。"""
+        previous_palette = theme.pal_name
         theme.feed_luminance(self.backdrop.luminance)
         if not changed:
             return
-        if self._bd_shown is not None and self._bd_shown[0] is not self.backdrop.state[0]:
-            self._bd_prev = self._bd_shown            # 旧背景淡出、新背景淡入
-            self._bd_fade_t0 = time.perf_counter()
+        now = time.perf_counter()
+        continuing = False
+        if self._bd_target is not None:
+            progress = self._backdrop_progress(now)
+            self._bd_prev = Backdrop.blend_states(self._bd_prev, self._bd_target, progress)
+            if progress < 1 and previous_palette == theme.pal_name:
+                # 沿原缓动曲线的剩余部分继续，不重新缓入，也不推迟终点。
+                self._bd_fade_from = clamp((now - self._bd_fade_t0) / self._bd_fade_duration, 0, 1)
+                continuing = True
+        self._bd_target = self.backdrop.state
+        if not continuing:
+            self._bd_fade_t0 = now
+            self._bd_fade_duration = THEME_TRANSITION_MS / 1000
+            self._bd_fade_from = 0.0
         self._kick()
 
+    def _backdrop_progress(self, now: float) -> float:
+        """本次背景渐变的缓动进度；绘制与中途接续使用同一计算。"""
+        if self._bd_prev is None:
+            return 1.0
+        progress = THEME_EASING.valueForProgress(clamp((now - self._bd_fade_t0) / self._bd_fade_duration, 0, 1))
+        start = THEME_EASING.valueForProgress(self._bd_fade_from)
+        return clamp((progress - start) / max(1e-9, 1 - start), 0, 1)
+
     # ================================================================ 绘制
+    def _paint_edge_handle(self, p: QtGui.QPainter):
+        """绘制有弹性悬停、柔光和中心向外蓄力进度的边缘小胶囊。"""
+        hover = clamp(self.edge_hover_a.x, 0, 1.08)
+        progress = clamp(self.edge_progress.x, 0, 1)
+        horizontal = self.edge in ("top", "bottom")
+        dx, dy = (4.0 * hover, 1.5 * hover) if horizontal else (1.5 * hover, 4.0 * hover)
+        rect = self.body.adjusted(-dx, -dy, dx, dy)
+        radius = min(rect.width(), rect.height()) / 2
+        capsule = QtGui.QPainterPath()
+        capsule.addRoundedRect(rect, radius, radius)
+        accent = theme.text()
+        for width, alpha in ((8, 0.04), (4, 0.08)):
+            glow = QtGui.QColor(accent)
+            glow.setAlphaF(alpha * min(hover, 1))
+            p.strokePath(capsule, QtGui.QPen(glow, width))
+        p.fillPath(capsule, theme.text(0.38 + 0.12 * min(hover, 1)))
+        if progress > 0.001:
+            # 在整颗胶囊上铺柔边亮度渐变，不绘制会在起步/退出时缩成小点的独立色块。
+            start = rect.topLeft()
+            end = rect.topRight() if horizontal else rect.bottomLeft()
+            gradient = QtGui.QLinearGradient(start, end)
+            spread = 0.18 + 0.32 * progress
+            intensity = 0.42 * min(hover, 1) * smooth(progress / 0.16)
+            transparent = theme.text(0)
+            bright = theme.text(intensity)
+            gradient.setColorAt(0, transparent)
+            gradient.setColorAt(max(0.001, 0.5 - spread), transparent)
+            gradient.setColorAt(0.5 - spread * 0.55, bright)
+            gradient.setColorAt(0.5 + spread * 0.55, bright)
+            gradient.setColorAt(min(0.999, 0.5 + spread), transparent)
+            gradient.setColorAt(1, transparent)
+            p.fillPath(capsule, gradient)
+        highlight = QtGui.QColor(255, 255, 255)
+        highlight.setAlphaF(0.18 * min(hover, 1))
+        p.strokePath(capsule, QtGui.QPen(highlight, 0.8))
+
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
         path = self.path
         if path.isEmpty():
+            return
+        if self.edge_hidden and self.edge_hide_a.rest and self.sw.rest and self.sh.rest:
+            self._bd_prev = None
+            self._bd_target = None
+            self._paint_edge_handle(p)
+            p.end()
             return
         # 1) 柔和阴影（几层半透明描边，廉价近似）
         sp = path.translated(0, 1.5)
@@ -982,9 +1135,9 @@ class Island(QtWidgets.QWidget):
         """毛玻璃底 + 色调 + 光泽（灵动岛本体与内容渐显面纱共用）。"""
         base_opacity = p.opacity()
         # 2) 毛玻璃底（新截图与上一张交叉淡入，避免跳变）
-        state = self.backdrop.state
+        state = self._bd_target
         br = self.backdrop.brush_for(state, self._win_origin)
-        fade = (time.perf_counter() - self._bd_fade_t0) / 0.25 if self._bd_prev is not None else 1.0
+        fade = self._backdrop_progress(time.perf_counter())
         if fade < 1.0:
             prev = self.backdrop.brush_for(self._bd_prev, self._win_origin)
             if prev is not None:
@@ -1000,13 +1153,11 @@ class Island(QtWidgets.QWidget):
                 p.fillPath(path, br)
             else:
                 p.fillPath(path, QtGui.QColor(128, 128, 128, 200))
-        if crossfade:
-            self._bd_shown = state
         # 3) 色调 + 纵向光泽
         p.fillPath(path, theme.tint_brush(self.body))
         bb = self.body
         g = QtGui.QLinearGradient(0, bb.top(), 0, bb.bottom())
-        g.setColorAt(0, QtGui.QColor(255, 255, 255, 26 if not theme.dark else 14))
+        g.setColorAt(0, theme.glass_gloss())
         g.setColorAt(0.5, QtGui.QColor(255, 255, 255, 0))
         g.setColorAt(1, QtGui.QColor(255, 255, 255, 10))
         p.fillPath(path, g)
@@ -1021,10 +1172,15 @@ class Island(QtWidgets.QWidget):
             if self.edge in ("left", "right"):
                 pt = QtCore.QPointF(bb.right() if self.edge == "left" else bb.left(), bb.top() + bb.height() * ph)
             rad = QtGui.QRadialGradient(pt, max(60.0, bb.width() * 0.35))
-            rad.setColorAt(0, QtGui.QColor(255, 255, 255, 80 if not theme.dark else 55))
+            rad.setColorAt(0, theme.edge_glow())
             rad.setColorAt(1, QtGui.QColor(255, 255, 255, 0))
             p.strokePath(path, QtGui.QPen(QtGui.QBrush(rad), 1.0))
         # 6) 收起状态内容
+        if self.edge_hide_a.x > 0.01:
+            color = theme.text()
+            color.setAlphaF((0.38 + 0.25 * clamp(self.edge_progress.x, 0, 1))
+                           * clamp(self.edge_hide_a.x, 0, 1))
+            p.fillPath(path, color)
         if self.compact_a.x > 0.01:
             pk = clamp(self.poke.x, -0.5, 1.2) if (self.mode == "anchored" and not self.expanded) else 0.0
             _horiz = self.edge in ("top", "bottom")
@@ -1055,9 +1211,36 @@ class Island(QtWidgets.QWidget):
             self.release_focus()
         if self._fs_hidden or self.mode != "anchored":
             self._hover_since = self._out_since = None
+            self._edge_hover_since = None
+            if self.edge_hover_a.target or self.edge_progress.target:
+                self.edge_hover_a.to(0)
+                self.edge_progress.to(0)
+                self._kick()
             return
         inside = self._inside(QtGui.QCursor.pos())
         now = time.monotonic()
+        if self.edge_hidden:
+            if inside and self.sw.rest and self.sh.rest and not self.locks:
+                if self._edge_hover_since is None:
+                    self._edge_hover_since = now
+                elapsed = now - self._edge_hover_since
+                self.edge_hover_a.to(1)
+                self.edge_progress.to(clamp(elapsed / 3.0, 0, 1))
+                self._kick()
+                if elapsed >= 3.0:
+                    self.edge_progress.snap(1)
+                    self.set_edge_hidden(False)
+            else:
+                self._edge_hover_since = None
+                if self.edge_hover_a.target or self.edge_progress.target:
+                    self.edge_hover_a.to(0)
+                    self.edge_progress.to(0)
+                    self._kick()
+            return
+        if self._edge_reveal_wait_leave:
+            if inside or not self.edge_hide_a.rest:
+                return
+            self._edge_reveal_wait_leave = False
         if not self.expanded and self.mode == "anchored" and not self._fs_hidden:
             # 收起时（任何展开方式）：鼠标靠近就把水滴"挤"一下，离开后带回弹地恢复
             # 只有鼠标进入灵动岛范围才挤压；越靠近中心挤压越强（边缘处几乎不变形）。
@@ -1085,11 +1268,9 @@ class Island(QtWidgets.QWidget):
         if on_btn and not self.expanded:
             self._hover_since = None              # 在播放键上停留不展开
             return
-        if inside and self.passthrough():
-            inside = False                        # 可穿透：鼠标视为不在灵动岛上（只响应右键）
+        if inside and self.passthrough() and not self.expanded:
             self._hover_since = None
-            if not self.expanded:
-                return
+            return                                # 收起时不悬停展开；手动展开后正常交互
         if inside:
             self._out_since = None
             if not self.expanded and self.expand_mode() != "never":
@@ -1112,6 +1293,10 @@ class Island(QtWidgets.QWidget):
                     self.collapse()
 
     def mousePressEvent(self, e):
+        if self.edge_hidden:
+            if e.button() == Qt.MouseButton.RightButton:
+                self.menu_requested.emit(e.globalPosition().toPoint())
+            return
         if not self._inside(e.globalPosition().toPoint()):
             e.ignore()
             return
@@ -1150,6 +1335,8 @@ class Island(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(600, lambda: self.locks.discard("pin"))
 
     def mouseDoubleClickEvent(self, e):
+        if self.edge_hidden:
+            return
         if e.button() == Qt.MouseButton.LeftButton and self._on_play_button(e.position()):
             self.play_pause_requested.emit()       # 快速连点播放键：当作第二次点击，不切换长关
             return
@@ -1177,20 +1364,25 @@ class Island(QtWidgets.QWidget):
 
     def set_passthrough(self, on: bool):
         cfg.set("island.passthrough", bool(on))
+        self.apply_passthrough_setting()
+
+    def apply_passthrough_setting(self):
+        """根据已保存的穿透设置更新窗口，并同步主页快捷开关。"""
+        on = self.passthrough()
         self._apply_passthrough()
         if on and self.expanded and not self.pinned():
             self.collapse()
-        self.passthrough_changed.emit(bool(on))
+        self.passthrough_changed.emit(on)
 
     def _apply_passthrough(self):
-        """穿透 = 鼠标完全穿过（WS_EX_TRANSPARENT），只靠钩子响应右键。"""
+        """细线状态始终穿透；普通收起态按配置穿透，展开时临时接收鼠标。"""
         hwnd = int(self.winId())
         ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
         on = self.passthrough()
-        transparent = on
+        transparent = self.edge_hidden or (on and not self.expanded)
         ex = (ex | WS_EX_TRANSPARENT) if transparent else (ex & ~WS_EX_TRANSPARENT)
         user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex)
-        if on:
+        if transparent:
             self._rhook.install()
         else:
             self._rhook.remove()
@@ -1223,6 +1415,11 @@ class Island(QtWidgets.QWidget):
             return
         cfg.set("island.expand_mode", mode, save=False)
         cfg.set("island.pinned", mode == "always")
+        self.apply_expand_mode()
+
+    def apply_expand_mode(self):
+        """应用已保存的展开行为，不再次写入配置文件。"""
+        mode = self.expand_mode()
         if mode == "always":
             self.expand()
         elif mode == "never":
@@ -1248,7 +1445,7 @@ class Island(QtWidgets.QWidget):
         self.pin_changed.emit(bool(on))
 
     def wheelEvent(self, e):
-        if not self.expanded:
+        if not self.expanded and not self.edge_hidden:
             self.wheel_compact.emit(1 if e.angleDelta().y() > 0 else -1)
 
     # ================================================================ 焦点（输入框需要键盘）
@@ -1296,11 +1493,35 @@ class Island(QtWidgets.QWidget):
         if not self._registered_hotkeys:
             self.register_hotkeys()
         self._apply_passthrough()
-        if self.pinned():
-            QtCore.QTimer.singleShot(600, self.expand)
+        if self.pinned() and not self.edge_hidden:
+            QtCore.QTimer.singleShot(600, lambda: self.expand() if not self.edge_hidden else None)
         self.poll.start()
         self.backdrop.start()
         self._kick()
+
+    def set_hotkey(self, name: str, value: str):
+        """修改全局快捷键；只在系统注册成功后保存，留空则禁用。"""
+        key = f"hotkeys.{name}"
+        previous = cfg.get(key, "")
+        value = value.strip()
+        parsed = parse_hotkey(value)
+        if value and (not parsed or (parsed[0] == MOD_NOREPEAT and not 0x70 <= parsed[1] <= 0x87)):
+            raise ValueError("请输入有效组合键（例如 Ctrl+Alt+H），或使用 F1–F24。")
+        if parsed and any(other != name and parse_hotkey(spec) == parsed
+                          for other, spec in (cfg.get("hotkeys") or {}).items()):
+            raise ValueError("这个组合键与另一项 Wisland 快捷键重复。")
+        if value == previous and (not value or name in self._registered_hotkeys.values()):
+            return
+        cfg.set(key, value, save=False)
+        try:
+            self.register_hotkeys()
+            if value and name not in self._registered_hotkeys.values():
+                raise ValueError("这个组合键无法注册，可能被其他应用占用。已恢复原设置。")
+            cfg.save()
+        except (ValueError, OSError):
+            cfg.set(key, previous, save=False)
+            self.register_hotkeys()
+            raise
 
     def register_hotkeys(self):
         hwnd = int(self.winId())

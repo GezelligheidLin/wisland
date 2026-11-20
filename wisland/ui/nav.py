@@ -2,8 +2,7 @@
 """顶部导航：透明顶栏 + 图标组。
 
 - 标签没有背景色和分割线，图标/文字直接落在玻璃上；
-- 当前项展开显示文字，并加半透明白色圆角底；其余只留图标；
-- 切换时每项宽度都由弹簧驱动（欠阻尼 -> 弹性缓动），底块跟着宽度一起流动；
+- 等宽槽位不随选中项移动；当前项空间足够时显示文字，并加圆角底；
 - 长按空白处 -> drag_requested，用来拖动整个灵动岛。
 """
 from __future__ import annotations
@@ -18,8 +17,10 @@ from .widgets import IconButton, painter
 
 Qt = QtCore.Qt
 
-ICON_W = 34.0
-GAP = 16.0
+ICON_W = 20.0
+GAP = 6.0
+MAX_SLOT = 88.0
+SETTINGS_GAP = 12.0
 LONG_PRESS_MS = 380
 
 
@@ -34,13 +35,8 @@ class NavBar(QtWidgets.QWidget):
         self.setFixedHeight(height)
         self.setMouseTracking(True)
         self.font_ = ui_font(12.5, W.DemiBold)
-        fm = QtGui.QFontMetrics(self.font_)
-        self.full_w = [ICON_W + fm.horizontalAdvance(lbl) + 46 for _, _, lbl in items]   # 选中时文字右侧留出更大空白
-        self.anchor_fn = None          # 返回第一个标签（主页）中心应对齐的 x（导航栏坐标），None = 整组居中
-        self.w = [Spring(ICON_W, 260, 0.56, 0.05) for _ in items]
         self.hover = [Spring(0, 400, 1.0, 0.01) for _ in items]
         self.badges: dict[str, int] = {}
-        self.w[0].snap(self.full_w[0])
         self._hover_i = -1
         self._press_pos: QtCore.QPoint | None = None
         self._lp = QtCore.QTimer(self, singleShot=True, interval=LONG_PRESS_MS, timeout=self._long_press)
@@ -49,11 +45,11 @@ class NavBar(QtWidgets.QWidget):
         theme.changed.connect(self.update)
 
         # 右侧按钮（不属于图标组）
-        self.extra = QtWidgets.QHBoxLayout()
         self.right_buttons: list[IconButton] = []
 
     def add_right_button(self, glyph: str, tip: str, cb) -> IconButton:
         b = IconButton(glyph, 30, 13, tip, self)
+        b.setAccessibleName(tip)
         b.clicked.connect(cb)
         self.right_buttons.append(b)
         self._place_right()
@@ -73,6 +69,21 @@ class NavBar(QtWidgets.QWidget):
     def keys(self) -> list[str]:
         return [k for k, _, _ in self.items]
 
+    def set_items(self, items: list[tuple[str, str, str]]):
+        """替换可见标签，保留当前选择；调用方须至少提供一个标签。"""
+        if not items:
+            raise ValueError("导航至少需要一个标签")
+        current = self.current()
+        self._lp.stop()
+        self._press_pos = None
+        self._hover_i = -1
+        self.unsetCursor()
+        self.items = items
+        keys = self.keys()
+        self.index = keys.index(current) if current in keys else 0
+        self.hover = [Spring(0, 400, 1.0, 0.01) for _ in items]
+        self.update()
+
     def set_current(self, key: str, emit: bool = False):
         keys = self.keys()
         if key not in keys:
@@ -81,9 +92,7 @@ class NavBar(QtWidgets.QWidget):
         if i == self.index:
             return
         self.index = i
-        for j, s in enumerate(self.w):
-            s.to(self.full_w[j] if j == i else ICON_W)
-        self._kick()
+        self.update()
         if emit:
             self.changed.emit(key)
 
@@ -105,7 +114,7 @@ class NavBar(QtWidgets.QWidget):
         dt = min(0.05, now - self._last)
         self._last = now
         rest = True
-        for s in self.w + self.hover:
+        for s in self.hover:
             s.step(dt)
             rest = rest and s.rest
         self.update()
@@ -113,39 +122,38 @@ class NavBar(QtWidgets.QWidget):
             self._t.stop()
 
     def _rects(self) -> list[QtCore.QRectF]:
-        """「主页」标签固定在播放器封面正上方；最后一个标签放在与之对称的位置，
-        中间的标签按比例均分间距，整排左右居中。没有锚点时整组居中。"""
-        widths = [max(ICON_W * 0.7, s.x) for s in self.w]
-        n = len(widths)
-        right = sum(b.width() + 2 for b in self.right_buttons)
-        h = self.height()
-        ax = None
-        if self.anchor_fn is not None:
-            try:
-                ax = self.anchor_fn()
-            except Exception:  # noqa: BLE001
-                ax = None
-        if ax is not None and n > 1:
-            left = ax - widths[0] / 2
-            end = self.width() - ax + widths[-1] / 2          # 与主页标签对称
-            end = min(end, self.width() - right - 6)
-            gap = (end - left - sum(widths)) / (n - 1)
-            gap = max(GAP * 0.5, gap)
-        else:
-            gap = GAP
-            left = (self.width() - (sum(widths) + gap * (n - 1))) / 2
-        x = max(2.0, left)
-        out = []
-        for w in widths:
-            out.append(QtCore.QRectF(x, 2, w, h - 4))
-            x += w + gap
-        return out
+        """均分标签区域；标签较少时使用紧凑的居中组，而不是把图标拉到两端。"""
+        n = len(self.items)
+        end = min((b.x() - SETTINGS_GAP for b in self.right_buttons), default=self.width() - 2.0)
+        available = max(0.0, end - 2.0)
+        gap = min(GAP, available / (2 * n))
+        width = min(MAX_SLOT, (available - gap * (n - 1)) / n)
+        left = 2.0 + (available - width * n - gap * (n - 1)) / 2
+        return [QtCore.QRectF(left + i * (width + gap), 2, width, self.height() - 4) for i in range(n)]
+
+    def _shows_label(self, index: int, width: float) -> bool:
+        label_width = QtGui.QFontMetrics(self.font_).horizontalAdvance(self.items[index][2])
+        return index == self.index and width >= ICON_W + 5 + label_width + 14
 
     def _hit(self, pos: QtCore.QPointF) -> int:
         for i, r in enumerate(self._rects()):
             if r.contains(pos):
                 return i
         return -1
+
+    def event(self, e):
+        if e.type() == QtCore.QEvent.Type.ToolTip:
+            i = self._hit(e.pos())
+            if i >= 0:
+                key, _, label = self.items[i]
+                count = self.badges.get(key, 0)
+                tip = f"{label} · {count} 项提醒待处理" if key == "todo" and count else label
+                QtWidgets.QToolTip.showText(e.globalPos(), tip, self, self._rects()[i].toAlignedRect())
+            else:
+                QtWidgets.QToolTip.hideText()
+                e.ignore()
+            return True
+        return super().event(e)
 
     # --- 交互 ---
     def mouseMoveEvent(self, e):
@@ -160,6 +168,7 @@ class NavBar(QtWidgets.QWidget):
             self._kick()
         if self._press_pos is not None and (e.position().toPoint() - self._press_pos).manhattanLength() > 4:
             # 在空白处按住并移动 -> 立即拖动灵动岛
+            self._lp.stop()
             self._press_pos = None
             self.drag_requested.emit(QtGui.QCursor.pos())
 
@@ -178,6 +187,7 @@ class NavBar(QtWidgets.QWidget):
             self._press_pos = None
         else:
             self._press_pos = e.position().toPoint()
+            self._lp.start()
 
     def mouseReleaseEvent(self, e):
         self._lp.stop()
@@ -196,37 +206,35 @@ class NavBar(QtWidgets.QWidget):
     def paintEvent(self, e):
         p = painter(self)
         rects = self._rects()
-        # 当前项底块：半透明白色圆角
-        ar = rects[self.index]
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(theme.active_pill())
-        p.drawRoundedRect(ar, ar.height() / 2, ar.height() / 2)
+        fm = QtGui.QFontMetrics(self.font_)
         for i, (key, glyph, label) in enumerate(self.items):
-            r = rects[i]
+            slot = rects[i]
             active = i == self.index
-            # 悬停：极淡的圆
-            if not active and self.hover[i].x > 0.01:
-                c = theme.hover()
-                c.setAlphaF(c.alphaF() * self.hover[i].x * 0.8)
+            has_label = self._shows_label(i, slot.width())
+            label_width = fm.horizontalAdvance(label) if has_label else 0
+            group_width = ICON_W + (5 + label_width if has_label else 0)
+            pill_width = min(slot.width(), max(34, group_width + 14))
+            r = QtCore.QRectF(slot.center().x() - pill_width / 2, slot.y(), pill_width, slot.height())
+            opacity = self.hover[i].x
+            if active or opacity > 0.01:
+                c = theme.active_pill() if active else theme.hover()
+                if not active:
+                    c.setAlphaF(c.alphaF() * opacity * 0.8)
+                p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(c)
                 p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
-            a = 1.0 if active else 0.55 + 0.4 * self.hover[i].x
+            p.save()
+            p.setClipRect(slot)
+            x = slot.center().x() - group_width / 2
             p.setFont(icon_font(15))
-            p.setPen(theme.pill_text() if active else theme.text(a))
-            p.drawText(QtCore.QRectF(r.x(), r.y(), ICON_W, r.height()), Qt.AlignmentFlag.AlignCenter, glyph)
-            # 文字：随宽度展开渐显，裁剪在本项矩形内
-            extra = self.full_w[i] - ICON_W
-            prog = clamp((r.width() - ICON_W) / extra, 0, 1) if extra > 0 else 0
-            if prog > 0.02:
-                p.save()
-                p.setClipRect(r.adjusted(0, 0, -4, 0))
+            p.setPen(theme.pill_text() if active else theme.text(0.55 + 0.4 * opacity))
+            p.drawText(QtCore.QRectF(x, r.y(), ICON_W, r.height()), Qt.AlignmentFlag.AlignCenter, glyph)
+            if has_label:
                 p.setFont(self.font_)
-                p.setPen(theme.pill_text(prog))
-                p.drawText(QtCore.QRectF(r.x() + ICON_W - 4, r.y(), extra + 8, r.height()),
+                p.drawText(QtCore.QRectF(x + ICON_W + 5, r.y(), label_width + 2, r.height()),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
-                p.restore()
-            n = self.badges.get(key, 0)
-            if n:
-                p.setBrush(QtGui.QColor("#ff453a"))
+            if self.badges.get(key, 0):
                 p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QtCore.QPointF(r.x() + ICON_W / 2 + 7, r.y() + 8), 3.2, 3.2)
+                p.setBrush(QtGui.QColor("#ff453a"))
+                p.drawEllipse(QtCore.QPointF(x + ICON_W - 1, r.center().y() - 8), 3.0, 3.0)
+            p.restore()
