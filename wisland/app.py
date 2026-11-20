@@ -7,12 +7,13 @@ import sys
 import time
 import traceback
 import winreg
+from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .core import bg
-from .core.config import CONFIG_PATH, DATA_DIR, ROOT, cfg, expand
+from .core.config import DATA_DIR, ROOT, cfg, expand
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -104,7 +105,7 @@ def set_autostart(on: bool):
         else:
             try:
                 winreg.DeleteValue(k, "wisland")
-            except OSError:
+            except FileNotFoundError:
                 pass
 
 
@@ -127,9 +128,10 @@ def main():
     from .services.clipboard import ClipboardService
     from .services.mailcheck import MailCheckService
     from .services.media import MediaService
-    from .services.notify import NotifyService
+    from .services.notify import NotifyService, notification_summary
     from .services.stocks import StockService
     from .services.system import RadioService, WindowService
+    from .services.todo import TodoService, TodoStore
     from .services.lyrics import LyricsService
     from .services.translate import TranslateService
     from .services.weather import WeatherService, weather_glyph
@@ -137,10 +139,16 @@ def main():
     from .ui.pages.home import HomePage, MessagesPage
     from .ui.pages.info import StocksPage, WeatherPage
     from .ui.pages.system import ControlsPage, styled_menu
+    from .ui.pages.todo import TodoPage
     from .ui.pages.tools import ClipboardPage, TranslatePage
-    from .ui.theme import KIND_COLORS, THEME_NAMES, G, theme
+    from .ui.settings import SettingsWindow
+    from .ui.todo import TodoWindow
+    from .ui.theme import KIND_COLORS, G, theme
     from .ui.widgets import glyph_pixmap
 
+    # 独立窗口的标题栏和任务栏沿用托盘图标，避免显示 pythonw 的默认图标。
+    app_icon = QtGui.QIcon(glyph_pixmap(G.APPS, 32, QtGui.QColor("#4f8cff")))
+    app.setWindowIcon(app_icon)
     theme.set_mode(cfg.get("island.theme", "auto"))
     ctx = SimpleNamespace()
     ctx.media = MediaService()
@@ -165,8 +173,19 @@ def main():
     ctx.windows.notice.connect(lambda t: ctx.island and ctx.island.activity({"glyph": _G().MESSAGE, "title": t}, 5.0))
     ctx.island = None
 
+    local_data = QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.AppLocalDataLocation)
+    todo_dir = Path(local_data) if local_data else Path.home() / "AppData" / "Local" / "wisland"
+    todo_service = TodoService(TodoStore(todo_dir / "todos.sqlite3"))
+    todo_window = None
+
+    def show_todos(quick: bool = False, todo_id: int | None = None):
+        nonlocal todo_window
+        if todo_window is None:
+            todo_window = TodoWindow(todo_service)
+        todo_window.present(island.screen(), quick=quick, todo_id=todo_id)
+
     pages = [HomePage(ctx), MessagesPage(ctx), StocksPage(ctx), WeatherPage(ctx), ControlsPage(ctx),
-             ClipboardPage(ctx), TranslatePage(ctx)]
+             ClipboardPage(ctx), TranslatePage(ctx), TodoPage(todo_service, show_todos)]
     ctx.pages = {p.key: p for p in pages}
     P = ctx.pages
 
@@ -275,10 +294,17 @@ def main():
 
 
     # ---------------- 消息提醒 ----------------
+    def on_open_failed(message):
+        """打开失败时在当前鼠标位置提示，保留记录以便重试。"""
+        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), message, island)
+        island.activity({"glyph": G.MESSAGE, "title": "打开应用失败", "sub": message}, 5.0)
+
+    ctx.notify.open_failed.connect(on_open_failed)
+
     def on_notified(n):
         kind = n.get("kind", "other")
-        glyph = {"mail": G.MAIL, "qq": G.CHAT, "wechat": G.MESSAGE}.get(kind, G.BELL)
-        sub = "新邮件" if kind == "mail" else (n.get("sender") or "新消息")
+        glyph = {"mail": G.MAIL, "qq": G.CHAT, "wechat": G.MESSAGE, "dingtalk": G.MESSAGE}.get(kind, G.BELL)
+        sub = notification_summary(n)
         compact.pet.react("surprise")
         P["home"].pet.face.react("surprise")
         island.activity({"glyph": glyph, "color": KIND_COLORS.get(kind, KIND_COLORS["other"]),
@@ -353,43 +379,62 @@ def main():
     ctx.learn.notice.connect(lambda t: island.activity({"glyph": _G().CHECK, "title": t}, 2.6))
     ctx.live.error.connect(lambda m: island.activity({"glyph": G.LIVE, "title": "实时字幕", "sub": m}, 4))
 
+    # ---------------- 本地待办 ----------------
+    def on_todo_due(count: int):
+        # 不抢占实时字幕或正在展示的其他信号；未处理记录始终留在清单中。
+        if (not cfg.get("todo.popup", True) or island.expanded or island.edge_hidden
+                or ctx.windows.foreground_is_fullscreen(int(island.winId()))
+                or compact.mode() in ("activity", "subtitle")):
+            return
+        island.activity({"glyph": G.TODO, "title": f"{count} 项待办提醒"}, 4)
+
+    todo_service.due.connect(on_todo_due)
+
     # ---------------- 热键 ----------------
     def on_hotkey(name):
         if name == "toggle":
             island.toggle()
+        elif name == "edge_hide":
+            island.toggle_edge_hidden()
         elif name == "translate":
             ctx.actions.translate_clipboard()
         elif name == "clipboard":
             island.toggle("clip")
+        elif name == "todo_add":
+            show_todos(quick=True)
     island.hotkey.connect(on_hotkey)
 
     # ---------------- 菜单 / 托盘 ----------------
     def reload_cfg():
+        mode, passthrough, capture = island.expand_mode(), island.passthrough(), island.capture_visible()
         cfg.load()
+        island.apply_visible_tabs()
+        if mode != island.expand_mode():
+            island.apply_expand_mode()
+        if passthrough != island.passthrough():
+            island.apply_passthrough_setting()
+        if capture != island.capture_visible():
+            island.apply_capture_mode()
         theme.set_mode(cfg.get("island.theme", "auto"))
         island.register_hotkeys()
         P["home"].build_launcher()
         ctx.weather.refresh()
         island.activity({"glyph": G.CHECK, "title": "配置已重新加载"}, 1.8)
 
+    settings = None
+
+    def show_settings():
+        nonlocal settings
+        if settings is None:
+            settings = SettingsWindow(island, autostart_enabled, set_autostart, reload_cfg)
+        settings.present()
+
     def build_menu(menu: QtWidgets.QMenu):
-        menu.addAction("编辑配置 config.json").triggered.connect(lambda: os.startfile(str(CONFIG_PATH)))  # noqa: S606
-        menu.addAction("重新加载配置").triggered.connect(reload_cfg)
-        tm = menu.addMenu("主题")
-        for mode, label in THEME_NAMES:
-            a = tm.addAction(("✓  " if cfg.get("island.theme") == mode else "    ") + label)
-            a.triggered.connect(lambda _=False, m=mode: (cfg.set("island.theme", m), theme.set_mode(m)))
-        em = menu.addMenu("展开方式")
-        for mode, label in (("hover", "悬停展开"), ("always", "常驻展开"), ("never", "长关")):
-            a = em.addAction(("✓  " if island.expand_mode() == mode else "    ") + label)
-            a.triggered.connect(lambda _=False, m=mode: island.set_expand_mode(m))
-        a = menu.addAction(("✓  " if island.passthrough() else "    ") + "可穿透")
-        a.triggered.connect(lambda: island.set_passthrough(not island.passthrough()))
-        a = menu.addAction(("✓  " if island.capture_visible() else "    ") + "参与截图")
-        a.triggered.connect(lambda: island.set_capture_visible(not island.capture_visible()))
-        a = menu.addAction(("✓  " if autostart_enabled() else "    ") + "开机自启")
-        a.triggered.connect(lambda: set_autostart(not autostart_enabled()))
-        menu.addAction("打开数据目录").triggered.connect(lambda: os.startfile(str(DATA_DIR)))  # noqa: S606
+        menu.addAction("设置…").triggered.connect(lambda: QtCore.QTimer.singleShot(0, show_settings))
+        menu.addSeparator()
+        menu.addAction("恢复灵动岛" if island.edge_hidden else "贴边隐藏").triggered.connect(island.toggle_edge_hidden)
+        menu.addAction("收起面板" if island.expanded else "展开面板").triggered.connect(
+            lambda: island.toggle() if island.expanded else island.expand())
         menu.addSeparator()
         menu.addAction("退出 wisland").triggered.connect(app.quit)
 
@@ -400,14 +445,6 @@ def main():
         m.aboutToHide.connect(lambda: island.locks.discard("menu"))
         m.popup(pos)
     island.menu_requested.connect(show_menu)
-    # 导航：「主页」标签放在播放器封面正上方
-    def nav_anchor():
-        m = P["home"].media
-        if m.width() < 10:
-            return None
-        g = m.mapToGlobal(QtCore.QPoint(m.width() // 2, 0))
-        return island.nav.mapFromGlobal(g).x()
-    island.nav.anchor_fn = nav_anchor
 
     # 主页的「保持展开」「可穿透」按钮
     home = P["home"]
@@ -435,13 +472,23 @@ def main():
     home.a_pt.set_on(island.passthrough(), None, "可穿透")
     if island.passthrough():
         compact.set_view("pet")
-    island.nav.add_right_button(G.GEAR, "设置", lambda: show_menu(QtGui.QCursor.pos()))
+    island.nav.add_right_button(G.GEAR, "设置", show_settings)
 
-    tray = QtWidgets.QSystemTrayIcon(QtGui.QIcon(glyph_pixmap(G.APPS, 32, QtGui.QColor("#4f8cff"))), app)
+    def update_todo_badge():
+        island.nav.set_badge("todo", todo_service.pending)
+
+    todo_service.changed.connect(update_todo_badge)
+
+    tray = QtWidgets.QSystemTrayIcon(app_icon, app)
     tray.setToolTip("wisland 灵动岛")
     tmenu = QtWidgets.QMenu()
-    tmenu.aboutToShow.connect(lambda: (tmenu.clear(), tmenu.addAction("展开 / 收起").triggered.connect(island.toggle),
-                                       build_menu(tmenu)))
+
+    def refresh_tray_menu():
+        tmenu.clear()
+        tmenu.addAction("待办事项…").triggered.connect(lambda: QtCore.QTimer.singleShot(0, show_todos))
+        build_menu(tmenu)
+
+    tmenu.aboutToShow.connect(refresh_tray_menu)
     tray.setContextMenu(tmenu)
     tray.activated.connect(lambda r: island.toggle() if r == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger else None)
     tray.show()
@@ -477,6 +524,7 @@ def main():
         except Exception:  # noqa: BLE001
             traceback.print_exc()
     fs_timer.start()
+    QtCore.QTimer.singleShot(0, todo_service.start)
 
     def shutdown():
         ctx.live.stop(wait=True)
