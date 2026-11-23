@@ -2,6 +2,7 @@
 PySide6-Essentials>=6.8
 psutil
 httpx
+cryptography>=44
 pycaw
 comtypes
 pyyaml

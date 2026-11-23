@@ -63,10 +63,14 @@ class SettingsUpdates(QtCore.QObject):
     def __init__(self):
         super().__init__()
         self._checking = False
+        self.install_progress = None
+        self.install_failed = False
+        self.can_install = False
         self.error = False
         self.checked = False
         self.latest = None
         self.check_count = 0
+        self.install = Mock()
 
     def check(self):
         self.check_count += 1
@@ -218,6 +222,17 @@ class SettingsWindowTests(_ConfigTests):
         self.assertEqual(status.text(), "发现新版本 v1.2.4")
         self.assertTrue(control(QtWidgets.QPushButton, "下载 ZIP").isVisible())
         self.assertFalse(control(QtWidgets.QPushButton, "下载 EXE").isVisible())
+        self.assertTrue(window._update_install_button.isHidden())
+        updates.can_install = True
+        updates.changed.emit()
+        with patch.object(QtWidgets.QMessageBox, "question", return_value=QtWidgets.QMessageBox.StandardButton.Yes):
+            self.click(window._update_install_button)
+        updates.install.assert_called_once_with()
+        updates.can_install = False
+        updates.install_progress = 42
+        updates.changed.emit()
+        self.assertEqual(status.text(), "正在下载更新 42%")
+        self.assertFalse(control(QtWidgets.QPushButton, "立即检查更新").isEnabled())
 
 
 class HotkeySettingsTests(_ConfigTests):

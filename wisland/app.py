@@ -7,12 +7,14 @@ import sys
 import time
 import traceback
 import winreg
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .core import bg
+from .core.apply_update import STAGE_ENV, clean_update_stage, update_gate
 from .core.config import DATA_DIR, ROOT, cfg, expand
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -121,7 +123,17 @@ def main():
 
     lock = QtCore.QLockFile(str(DATA_DIR / "wisland.lock"))
     lock.setStaleLockTime(0)
-    if not lock.tryLock(100):
+    update_stage = os.environ.pop(STAGE_ENV, "")
+    try:
+        if getattr(sys, "frozen", False):
+            with update_gate(DATA_DIR, timeout=3 if update_stage else 0):
+                acquired = lock.tryLock(100)
+        else:
+            acquired = lock.tryLock(100)
+    except OSError:
+        print("Wisland 正在应用更新")
+        return 1
+    if not acquired:
         print("wisland 已在运行")
         return 0
     fix_autostart()
@@ -560,4 +572,7 @@ def main():
         cfg.save()
         lock.unlock()
     app.aboutToQuit.connect(shutdown)
+    if update_stage and Path(update_stage).name == update_stage:
+        clean_stage = partial(clean_update_stage, DATA_DIR / update_stage, DATA_DIR, completed_only=True)
+        QtCore.QTimer.singleShot(0, lambda: bg.run_bg(clean_stage))
     return app.exec()

@@ -2,13 +2,15 @@
 """将 GitHub Actions 已打包的发行文件镜像到私有 OSS Bucket。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 
 import alibabacloud_oss_v2 as oss
 
-from wisland.core.release import MANIFEST_KEY, download_origin, release_object_keys, version_number
+from wisland.core.release import (MANIFEST_KEY, download_origin, release_object_keys,
+                                  sign_manifest, version_number)
 
 
 def published_version(client: oss.Client, bucket: str) -> tuple[int, ...] | None:
@@ -24,7 +26,8 @@ def published_version(client: oss.Client, bucket: str) -> tuple[int, ...] | None
         return version_number(json.loads(stream.read())["version"])
 
 
-def publish(client: oss.Client, bucket: str, version: str, artifacts: Path):
+def publish(client: oss.Client, bucket: str, version: str, artifacts: Path,
+            signing_key: str = "", public_key: str = ""):
     """先上传两个安装包，确认完成后再更新客户端读取的 latest.json。"""
     target_version = version_number(version)
     version = ".".join(map(str, target_version))
@@ -33,13 +36,26 @@ def publish(client: oss.Client, bucket: str, version: str, artifacts: Path):
         print(f"OSS 已有 v{version} 或更新的版本，跳过镜像发布")
         return
 
-    packages = [(key, artifacts / Path(key).name) for key in release_object_keys(version).values()]
-    for _, path in packages:
+    packages = {kind: (key, artifacts / Path(key).name) for kind, key in release_object_keys(version).items()}
+    manifest = {"version": version}
+    metadata = {}
+    for kind, (_, path) in packages.items():
         if not path.is_file() or not path.stat().st_size:
             raise FileNotFoundError(f"安装包不存在或为空：{path.name}")
+        if signing_key:
+            digest = hashlib.sha256()
+            with path.open("rb") as body:
+                while block := body.read(1024 * 1024):
+                    digest.update(block)
+            metadata[kind] = {"size": path.stat().st_size, "sha256": digest.hexdigest()}
+    if signing_key or public_key:
+        if not signing_key or not public_key:
+            raise ValueError("请同时配置更新签名私钥与公钥")
+        manifest["packages"] = metadata
+        manifest["signature"] = sign_manifest(manifest, signing_key, public_key)
 
     uploader = client.uploader()
-    for key, path in packages:
+    for key, path in packages.values():
         uploader.upload_file(oss.PutObjectRequest(
             bucket=bucket,
             key=key,
@@ -54,7 +70,7 @@ def publish(client: oss.Client, bucket: str, version: str, artifacts: Path):
         key=MANIFEST_KEY,
         content_type="application/json",
         cache_control="no-store",
-        body=json.dumps({"version": version}).encode("utf-8"),
+        body=json.dumps(manifest).encode("utf-8"),
     ))
     print(f"OSS 更新源已发布 v{version}")
 
@@ -73,7 +89,8 @@ def main():
     if upload_domain := os.environ.get("WISLAND_OSS_UPLOAD_ORIGIN"):
         config.endpoint = download_origin(upload_domain)
         config.use_cname = True
-    publish(oss.Client(config), bucket, os.environ["WISLAND_RELEASE_VERSION"], Path("release-assets"))
+    publish(oss.Client(config), bucket, os.environ["WISLAND_RELEASE_VERSION"], Path("release-assets"),
+            os.environ.get("WISLAND_UPDATE_PRIVATE_KEY", ""), os.environ.get("WISLAND_UPDATE_PUBLIC_KEY", ""))
 
 
 if __name__ == "__main__":

@@ -130,6 +130,7 @@ class SettingsWindow(QtWidgets.QDialog):
         self._hotkey_buttons = {}
         self._update_status = None
         self._update_check_button = None
+        self._update_install_button = None
         self._update_download_buttons = {}
 
         self.setObjectName("settings")
@@ -342,6 +343,10 @@ class SettingsWindow(QtWidgets.QDialog):
         download_layout = QtWidgets.QHBoxLayout(download_row)
         download_layout.setContentsMargins(0, 0, 0, 0)
         download_layout.setSpacing(6)
+        self._update_install_button = QtWidgets.QPushButton("立即更新")
+        self._update_install_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_install_button.clicked.connect(self._install_update)
+        download_layout.addWidget(self._update_install_button)
         for kind, title in (("zip", "下载 ZIP"), ("exe", "下载 EXE"), ("github", "GitHub 发布页")):
             button = QtWidgets.QPushButton(title)
             button.setAccessibleName(title)
@@ -349,7 +354,7 @@ class SettingsWindow(QtWidgets.QDialog):
             button.clicked.connect(lambda _checked=False, kind=kind: self._open_update_download(kind))
             download_layout.addWidget(button)
             self._update_download_buttons[kind] = button
-        updates.add_row("下载更新", "发现新版本后，可选择国内 OSS 安装包或 GitHub 发布页。", download_row)
+        updates.add_row("获取更新", "立即更新会从 OSS 下载并在重启时应用。", download_row, "下载更新")
         self._refresh_update_status()
 
         weather = self._card("高级", "天气服务")
@@ -390,11 +395,28 @@ class SettingsWindow(QtWidgets.QDialog):
         if self._updates is not None:
             self._updates.check()
 
+    def _install_update(self):
+        if self._updates is None or not self._updates.can_install:
+            return
+        update = self._updates.latest
+        confirm = QtWidgets.QMessageBox.question(
+            self, "Wisland 更新", f"更新到 v{update.version}？下载和校验完成后，Wisland 将重启。",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+        )
+        if confirm == QtWidgets.QMessageBox.StandardButton.Yes and self._updates.latest == update:
+            self._updates.install()
+
     def _refresh_update_status(self):
         if self._update_status is None:
             return
+        progress = self._updates.install_progress if self._updates is not None else None
         if self._updates is None:
             status = "更新检查不可用"
+            downloads = {}
+            github_url = ""
+        elif progress is not None:
+            status = f"正在下载更新 {progress}%" if progress < 100 else "正在校验并准备重启…"
             downloads = {}
             github_url = ""
         elif self._updates._checking:
@@ -407,7 +429,7 @@ class SettingsWindow(QtWidgets.QDialog):
             github_url = ""
         elif self._updates.latest is not None:
             update = self._updates.latest
-            status = f"发现新版本 v{update.version}"
+            status = "更新失败，可重试或手动下载。" if self._updates.install_failed else f"发现新版本 v{update.version}"
             downloads = update.downloads
             github_url = update.github_url
         else:
@@ -416,7 +438,9 @@ class SettingsWindow(QtWidgets.QDialog):
             github_url = ""
         self._update_status.setText(status)
         if self._update_check_button is not None:
-            self._update_check_button.setEnabled(self._updates is not None and not self._updates._checking)
+            self._update_check_button.setEnabled(self._updates is not None and not self._updates._checking
+                                                 and progress is None)
+        self._update_install_button.setVisible(self._updates is not None and self._updates.can_install)
         urls = {**downloads, "github": github_url}
         for kind, button in self._update_download_buttons.items():
             button.setVisible(bool(urls.get(kind)))
