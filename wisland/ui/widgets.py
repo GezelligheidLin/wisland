@@ -138,6 +138,8 @@ class IconButton(Hoverable):
 
     def paintEvent(self, e):
         p = painter(self)
+        if not self.isEnabled():
+            p.setOpacity(0.35)
         r = QtCore.QRectF(self.rect()).adjusted(1, 1, -1, -1)
         s = self.press_scale()
         p.translate(r.center())

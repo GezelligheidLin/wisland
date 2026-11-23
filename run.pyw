@@ -98,7 +98,12 @@ def _self_check() -> int:
         import winrt.windows.devices.radios        # noqa: F401
         import winrt.windows.media.control         # noqa: F401
         from wisland.services import media, system  # noqa: F401
+        from wisland.services.updates import InstalledRelease
         from wisland.services.weather import weather_glyph
+        if expected_version := os.environ.get("WISLAND_EXPECT_VERSION"):
+            installed = InstalledRelease.load()
+            if installed is None or installed.version != expected_version:
+                raise RuntimeError("安装包内的版本信息无效")
         glyph, family = weather_glyph("100")
         if not glyph or family == "Segoe Fluent Icons":
             raise RuntimeError("QWeather Icons 资产没有打进 exe")

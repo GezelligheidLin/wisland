@@ -4,9 +4,10 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from wisland.services import weather
 from wisland.ui.settings import SettingsWindow
@@ -227,6 +228,145 @@ class WeatherTests(unittest.TestCase):
                     restarted._city_key(city)]["attempt_date"], date.today().isoformat())
                 restarted._client.close()
             service._client.close()
+
+    def test_manual_refresh_retries_only_today_failures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cache_path = Path(folder) / "weather.json"
+            service = weather.WeatherService(cache_path=cache_path)
+            values = {"weather.cities": [{"name": "上海"}, {"name": "北京"}],
+                      "weather.uapi_key": "", "weather.lang": "zh"}
+            today = date.today().isoformat()
+            stale = weather.parse_uapis_weather(self.sample_response(), "北京")
+            shanghai = weather.parse_uapis_weather(self.sample_response(), "上海")
+            cache_path.write_text(json.dumps({"version": weather._CACHE_VERSION, "cities": {
+                service._city_key({"name": "上海"}): {
+                    "attempt_date": today, "data_date": today, "error": "", "data": shanghai},
+                service._city_key({"name": "北京"}): {
+                    "attempt_date": today, "data_date": today, "error": "天气请求超时", "data": stale},
+            }}, ensure_ascii=False), encoding="utf-8")
+            calls = []
+
+            def fake_run_bg(fn, *args, on_done=None, on_error=None):
+                calls.append((fn, args, on_done, on_error))
+                return None
+
+            busy = []
+            service.busy_changed.connect(busy.append)
+            with patch.object(weather.cfg, "get", side_effect=lambda key, default=None: values.get(key, default)), \
+                    patch.object(weather, "run_bg", side_effect=fake_run_bg):
+                self.assertFalse(service.refresh())            # 自动刷新：今天都试过了，不重试
+                self.assertEqual(calls, [])
+                self.assertTrue(service.refresh(force=True))   # 手动刷新：只重试失败的城市
+                self.assertEqual(len(calls), 1)
+                fetch, args, done, _error = calls[0]
+                self.assertEqual([city["name"] for _, city in args[1]], ["北京"])
+                self.assertEqual(busy, [True])
+                with patch.object(service, "_fetch_one",
+                                  return_value=weather.parse_uapis_weather(self.sample_response(), "北京")):
+                    done(fetch(*args))
+                self.assertEqual(busy, [True, False])
+                self.assertFalse(service.cities_data[1].get("error"))
+                self.assertFalse(service.refresh(force=True))  # 已成功，不再重复请求
+                self.assertEqual(len(calls), 1)
+            service._client.close()
+
+    def test_manual_refresh_during_request_runs_after_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cache_path = Path(folder) / "weather.json"
+            service = weather.WeatherService(cache_path=cache_path)
+            values = {"weather.cities": [{"name": "上海"}, {"name": "北京"}],
+                      "weather.uapi_key": "", "weather.lang": "zh"}
+            today = date.today().isoformat()
+            stale = weather.parse_uapis_weather(self.sample_response(), "北京")
+            cache_path.write_text(json.dumps({"version": weather._CACHE_VERSION, "cities": {
+                service._city_key({"name": "北京"}): {
+                    "attempt_date": today, "data_date": today, "error": "天气请求超时", "data": stale},
+            }}, ensure_ascii=False), encoding="utf-8")
+            calls = []
+
+            def fake_run_bg(fn, *args, on_done=None, on_error=None):
+                calls.append((fn, args, on_done, on_error))
+                return None
+
+            busy = []
+            service.busy_changed.connect(busy.append)
+            with patch.object(weather.cfg, "get", side_effect=lambda key, default=None: values.get(key, default)), \
+                    patch.object(weather, "run_bg", side_effect=fake_run_bg):
+                self.assertTrue(service.refresh())             # 上海今天没查过，先发请求
+                self.assertEqual([(i, city["name"]) for i, city in calls[0][1][1]], [(0, "上海")])
+                self.assertTrue(service.refresh(force=True))   # 请求中手动刷新 → 排队
+                self.assertEqual(len(calls), 1)
+                with patch.object(service, "_fetch_one",
+                                  return_value=weather.parse_uapis_weather(self.sample_response(), "上海")):
+                    fetch, args, done, _error = calls[0]
+                    done(fetch(*args))
+                self.assertEqual(len(calls), 2)
+                self.assertEqual([(i, city["name"]) for i, city in calls[1][1][1]], [(1, "北京")])
+                with patch.object(service, "_fetch_one",
+                                  return_value=weather.parse_uapis_weather(self.sample_response(), "北京")):
+                    fetch, args, done, _error = calls[1]
+                    done(fetch(*args))
+                self.assertEqual(busy, [True, True, False])
+                self.assertFalse(service.cities_data[1].get("error"))
+            service._client.close()
+
+
+class _WeatherStub(QtCore.QObject):
+    cities_updated = QtCore.Signal(list)
+    city_added = QtCore.Signal(bool, str)
+    busy_changed = QtCore.Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.busy = False
+        self.started = True
+        self.calls = []
+
+    def refresh(self, force=False):
+        self.calls.append(force)
+        self.busy = self.started
+        return self.started
+
+
+class WeatherPageRefreshTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+    def setUp(self):
+        from wisland.ui.pages.info import WeatherPage
+        self.weather = _WeatherStub()
+        self.page = WeatherPage(SimpleNamespace(weather=self.weather))
+        self.addCleanup(self.page._status.stop)
+        self.addCleanup(self.page.deleteLater)
+
+    def test_manual_refresh_reports_progress_and_completion(self):
+        self.page._refresh_clicked()
+        self.assertEqual(self.weather.calls, [True])
+        self.assertEqual(self.page.msg.text(), "正在刷新…")
+        self.assertFalse(self.page.refresh_btn.isEnabled())
+        self.page.data = [{"ok": True}]
+        self.weather.busy = False
+        self.weather.busy_changed.emit(False)
+        self.assertEqual(self.page.msg.text(), "已更新")
+        self.assertTrue(self.page.refresh_btn.isEnabled())
+        self.page._sync_msg()
+        self.assertEqual(self.page.msg.text(), "")
+
+    def test_manual_refresh_with_nothing_to_do_says_up_to_date(self):
+        self.weather.started = False
+        self.page._refresh_clicked()
+        self.assertEqual(self.page.msg.text(), "今日已是最新 · 明天自动更新")
+        self.assertTrue(self.page.refresh_btn.isEnabled())
+
+    def test_failed_manual_refresh_is_reported_then_restores_cache_notice(self):
+        self.page._refresh_clicked()
+        self.page.data = [{"error": "今日查询失败，显示上次缓存：天气请求超时"}]
+        self.weather.busy = False
+        self.weather.busy_changed.emit(False)
+        self.assertEqual(self.page.msg.text(), "刷新失败 · 稍后可再试")
+        self.page._sync_msg()
+        self.assertEqual(self.page.msg.text(), "今日查询失败，显示上次缓存：天气请求超时")
 
 
 if __name__ == "__main__":

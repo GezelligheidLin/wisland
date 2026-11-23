@@ -296,6 +296,7 @@ class WeatherService(QtCore.QObject):
     updated = QtCore.Signal(dict)
     cities_updated = QtCore.Signal(list)
     city_added = QtCore.Signal(bool, str)
+    busy_changed = QtCore.Signal(bool)     # 有网络请求在跑 / 刚结束（含排队中的手动刷新）
 
     def __init__(self, parent=None, cache_path: str | Path | None = None):
         super().__init__(parent)
@@ -306,6 +307,7 @@ class WeatherService(QtCore.QObject):
                                     follow_redirects=True, trust_env=False)
         self._busy = False
         self._again = False
+        self._again_force = False
         self.last: dict = {}
         self.cities_data: list[dict] = []
         self._cache_path = Path(cache_path) if cache_path else DATA_DIR / "weather_cache.json"
@@ -317,6 +319,10 @@ class WeatherService(QtCore.QObject):
         self._adding: set[str] = set()
         self._timer = QtCore.QTimer(self)
         self._timer.timeout.connect(self.refresh)
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
 
     def cities(self) -> list[dict]:
         configured = cfg.get("weather.cities")
@@ -401,7 +407,7 @@ class WeatherService(QtCore.QObject):
             return
 
         record = dict(record)
-        record.update(attempt_date=today, error="请求结果尚未缓存（今日不自动重试）")
+        record.update(attempt_date=today, error="请求结果尚未缓存（可点刷新重试）")
         cache[key] = record
         try:
             self._write_cache(cache)
@@ -477,11 +483,18 @@ class WeatherService(QtCore.QObject):
         delay_ms = max(1000, int((next_midnight - now).total_seconds() * 1000))
         self._timer.start(delay_ms)
 
-    def refresh(self):
-        """Publish today's cache; query only cities not yet attempted today."""
+    def refresh(self, force: bool = False) -> bool:
+        """Publish today's cache; query only cities not yet attempted today.
+
+        force=True（手动刷新）额外重试今天失败的条目，已成功的不再重复请求。
+        返回是否已发起或排队了一次请求；False 表示今天的数据都已是最新。
+        """
         if self._busy:
             self._again = True
-            return
+            self._again_force = self._again_force or force
+            return True
+        self._again = False
+        self._again_force = False
         self._run_date = date.today().isoformat()
         self._run_cities = self.cities()
         self._cache = self._read_cache()
@@ -492,7 +505,7 @@ class WeatherService(QtCore.QObject):
             key = self._city_key(city)
             record = self._cache.get(key) if isinstance(self._cache.get(key), dict) else {}
             cached = record.get("data") if isinstance(record.get("data"), dict) else None
-            if record.get("attempt_date") == self._run_date:
+            if record.get("attempt_date") == self._run_date and not (force and record.get("error")):
                 if cached:
                     row = dict(cached)
                     if record.get("error"):
@@ -508,14 +521,14 @@ class WeatherService(QtCore.QObject):
             # Persist before sending: even if the app exits mid-request, it won't
             # accidentally repeat a potentially billed request after restarting.
             updated = dict(record)
-            updated.update(attempt_date=self._run_date, error="请求结果尚未缓存（今日不自动重试）")
+            updated.update(attempt_date=self._run_date, error="请求结果尚未缓存（可点刷新重试）")
             self._cache[key] = updated
 
         if not self._pending:
             self.cities_data = [row for row in self._working if row is not None]
             self._publish()
             self._schedule_next_day()
-            return
+            return False
 
         try:
             self._write_cache(self._cache)
@@ -524,7 +537,18 @@ class WeatherService(QtCore.QObject):
             pass
         self._busy = True
         key = str(cfg.get("weather.uapi_key") or "").strip()
+        self.busy_changed.emit(True)
         run_bg(self._fetch_all, key, self._pending, on_done=self._done, on_error=self._fail)
+        return True
+
+    def _finish_run(self):
+        """一次请求结束后发布状态：期间积压的刷新直接续跑，不来回闪。"""
+        self._schedule_next_day()
+        again, again_force = self._again, self._again_force
+        self._again = self._again_force = False
+        if again and self.refresh(force=again_force):
+            return
+        self.busy_changed.emit(False)
 
     @staticmethod
     def _lang() -> str:
@@ -592,10 +616,7 @@ class WeatherService(QtCore.QObject):
             pass
         self.cities_data = [row for row in self._working if row is not None]
         self._publish()
-        self._schedule_next_day()
-        if self._again:
-            self._again = False
-            self.refresh()
+        self._finish_run()
 
     def _publish(self):
         for index, item in enumerate(self.cities_data):
@@ -626,7 +647,7 @@ class WeatherService(QtCore.QObject):
             pass
         self.cities_data = [row for row in self._working if row is not None]
         self._publish()
-        self._schedule_next_day()
+        self._finish_run()
 
     @staticmethod
     def _friendly(exc: Exception) -> str:

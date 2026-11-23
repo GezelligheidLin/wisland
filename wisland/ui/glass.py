@@ -94,7 +94,8 @@ def grab_tiny(px: int, py: int, pw: int, ph: int, tw: int, th: int) -> QtGui.QIm
 
 
 class Backdrop(QtCore.QObject):
-    """后台截取 + 模糊。主线程调用 request() 告知要覆盖的区域，结果通过 ready 信号回到主线程。"""
+    """后台截取 + 模糊。主线程调用 request() 告知要覆盖的区域，结果通过 ready 信号回到主线程。
+    远程模式下 set_paused(True) 暂停截取，纹理改由主线程 adopt / retarget 维护。"""
     ready = QtCore.Signal(bool)          # changed
     _captured = QtCore.Signal(object, bool)
 
@@ -115,6 +116,7 @@ class Backdrop(QtCore.QObject):
         self.hwnd = 0
         self.self_exclude = False
         self._started = False
+        self._paused = False
 
     def start(self):
         if not self._started:
@@ -132,6 +134,32 @@ class Backdrop(QtCore.QObject):
     @property
     def luminance(self):
         return self.state[2]
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def set_paused(self, on: bool):
+        """远程模式：暂停取背景，保留最后一张纹理，也就不再临时把自己排除出截图。
+        恢复时立刻补一张，玻璃马上跟上当前画面。"""
+        with self._lock:
+            changed = self._paused != bool(on)
+            self._paused = bool(on)
+        if changed and not self._paused:
+            self._wake.set()
+
+    def adopt(self, state):
+        """暂停期间由主线程接管纹理（例如冻结正在进行的背景渐变），之后的 retarget 基于它。"""
+        self.state = state
+
+    def retarget(self, grect: QtCore.QRect) -> bool:
+        """暂停期间让已有纹理跟着灵动岛的新区域平移 / 缩放，避免移动或展开时玻璃露底。
+        纹理本身很糊，拉伸看不出来；只在暂停时由主线程调用。"""
+        tiny, rect, lum = self.state
+        if tiny is None or grect == rect:
+            return False
+        self.state = (tiny, QtCore.QRect(grect), lum)
+        return True
 
     def stop(self):
         self._stop = True
@@ -161,6 +189,12 @@ class Backdrop(QtCore.QObject):
         while not self._stop:
             with self._lock:
                 interval = self._interval
+                paused = self._paused
+            if paused:
+                # 远程模式：不取背景，只等恢复 / 退出信号，避免空转占 CPU。
+                self._wake.wait(0.5)
+                self._wake.clear()
+                continue
             self._wake.wait(max(0.0, interval - (time.perf_counter() - last)))
             self._wake.clear()
             if self._stop:

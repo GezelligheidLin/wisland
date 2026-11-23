@@ -112,6 +112,7 @@ def set_autostart(on: bool):
 
 
 def main():
+    open_settings_on_start = "--open-settings" in sys.argv
     QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_DontCreateNativeWidgetSiblings)
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -136,6 +137,7 @@ def main():
     from .services.todo import TodoService, TodoStore
     from .services.lyrics import LyricsService
     from .services.translate import TranslateService
+    from .services.updates import InstalledRelease
     from .services.weather import WeatherService, weather_glyph
     from .ui.island import Island
     from .ui.pages.home import HomePage, MessagesPage
@@ -145,6 +147,7 @@ def main():
     from .ui.pages.tools import ClipboardPage, TranslatePage
     from .ui.settings import SettingsWindow
     from .ui.todo import TodoWindow
+    from .ui.updates import UpdateNotifications
     from .ui.theme import KIND_COLORS, G, theme
     from .ui.widgets import glyph_pixmap
 
@@ -308,7 +311,6 @@ def main():
         glyph = {"mail": G.MAIL, "qq": G.CHAT, "wechat": G.MESSAGE, "dingtalk": G.MESSAGE}.get(kind, G.BELL)
         sub = notification_summary(n)
         compact.pet.react("surprise")
-        P["home"].pet.face.react("surprise")
         island.activity({"glyph": glyph, "color": KIND_COLORS.get(kind, KIND_COLORS["other"]),
                          "title": n.get("name", kind), "sub": sub}, 4.0)
         if P["msg"].active:
@@ -417,9 +419,9 @@ def main():
             island.apply_passthrough_setting()
         if capture != island.capture_visible():
             island.apply_capture_mode()
+        island.apply_remote_mode()
         theme.set_mode(cfg.get("island.theme", "auto"))
         island.register_hotkeys()
-        P["home"].build_launcher()
         ctx.weather.refresh()
         island.activity({"glyph": G.CHECK, "title": "配置已重新加载"}, 1.8)
 
@@ -427,9 +429,14 @@ def main():
 
     def show_settings():
         nonlocal settings
-        if settings is None:
-            settings = SettingsWindow(island, autostart_enabled, set_autostart, reload_cfg)
-        settings.present()
+        try:
+            if settings is None:
+                settings = SettingsWindow(island, autostart_enabled, set_autostart, reload_cfg,
+                                          installed_release=installed, updates=updates)
+            settings.present()
+        except Exception:
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(None, "无法打开设置", traceback.format_exc())
 
     def build_menu(menu: QtWidgets.QMenu):
         menu.addAction("设置…").triggered.connect(lambda: QtCore.QTimer.singleShot(0, show_settings))
@@ -450,10 +457,17 @@ def main():
 
     # 主页的「保持展开」「可穿透」按钮
     home = P["home"]
-    MODE_UI = {"hover": (G.EYE, "悬停展开"), "always": (G.PIN, "常驻展开"), "never": (G.EYE_OFF, "长关")}
-    NEXT = {"hover": "always", "always": "never", "never": "hover"}
-    # 按钮只在 常驻展开 ↔ 悬停展开 之间切换；长关用双击灵动岛切换
-    home.a_pin.clicked.connect(lambda: island.set_expand_mode("hover" if island.expand_mode() == "always" else "always"))
+    MODE_UI = {"hover": (G.EYE, "悬停展开"), "click": (G.TOUCH, "点击展开"),
+               "always": (G.PIN, "常驻展开"), "never": (G.EYE_OFF, "长关")}
+    NEXT = {"hover": "click", "click": "always", "always": "hover", "never": "hover"}
+
+    # 按钮按 悬停 → 点击 → 常驻 循环；处于可穿透时先退出穿透，避免点了没有反应
+    def cycle_mode():
+        if island.passthrough():
+            island.set_passthrough(False)
+        island.set_expand_mode(NEXT.get(island.expand_mode(), "hover"))
+
+    home.a_pin.clicked.connect(cycle_mode)
     home.a_pt.clicked.connect(lambda: island.set_passthrough(not island.passthrough()))
 
     def on_mode(mode):
@@ -484,6 +498,11 @@ def main():
     tray = QtWidgets.QSystemTrayIcon(app_icon, app)
     tray.setToolTip("wisland 灵动岛")
     tmenu = QtWidgets.QMenu()
+    installed = InstalledRelease.load()
+    updates = None
+    if installed is not None:
+        app.setApplicationVersion(installed.version)
+        updates = UpdateNotifications(installed)
 
     def refresh_tray_menu():
         tmenu.clear()
@@ -518,6 +537,8 @@ def main():
 
     # ---------------- 启动 ----------------
     island.show()
+    if open_settings_on_start:
+        QtCore.QTimer.singleShot(0, show_settings)
     for s in (ctx.media, ctx.audio, ctx.brightness, ctx.radio, ctx.windows, ctx.notify, ctx.stocks,
               ctx.weather, ctx.clash, ctx.translate, ctx.clipboard, ctx.mailcheck, ctx.learn):
         try:

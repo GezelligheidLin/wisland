@@ -3,6 +3,7 @@
 
 GitHub Actions 在 windows-latest 上执行 `pyinstaller packaging/wisland.spec`。
 """
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -12,6 +13,8 @@ ICON = str(ROOT / "wisland" / "assets" / "wisland.ico")
 
 # 随包资源：天气图标字体 / 样式表 / 许可证。运行时按 _MEIPASS/wisland/assets 查找。
 datas = [(str(ROOT / "wisland" / "assets"), "wisland/assets")]
+if release_info := os.environ.get("WISLAND_RELEASE_INFO"):
+    datas.append((release_info, "wisland/services"))
 binaries = []
 hiddenimports = [
     "winrt.windows.foundation",

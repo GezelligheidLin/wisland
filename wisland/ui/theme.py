@@ -57,6 +57,7 @@ class G:
     DOWN = "\uE74B"
     ADD = "\uE710"
     POINTER = "\uE8B0"
+    TOUCH = "\uE7C9"
     EYE = "\uE890"
     EYE_OFF = "\uED1A"
     SEARCH = "\uE721"

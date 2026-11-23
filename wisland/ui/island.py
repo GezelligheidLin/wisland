@@ -22,6 +22,7 @@ from ctypes import wintypes
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.config import cfg
+from ..services.remote import RemoteWatch
 from .anim import Spring, clamp, lerp, smooth
 from .compact import CompactView
 from .glass import Backdrop, exclude_from_capture
@@ -233,6 +234,8 @@ class Island(QtWidgets.QWidget):
         self.peak_fn = peak_fn or (lambda: 0.0)
 
         self.backdrop = Backdrop()
+        self.remote = RemoteWatch(self)
+        self.remote.changed.connect(self._on_remote_changed)
         self.compact = CompactView()
         self.pages = pages
 
@@ -634,6 +637,8 @@ class Island(QtWidgets.QWidget):
     def _needs_frames(self) -> bool:
         if self.mode != "anchored" or self.drips or self._bd_prev is not None:
             return True
+        if self.remote.active and not self.backdrop.paused:
+            return True                  # 远程模式：等第一张种子纹理到位后再暂停取背景
         for s in (self.sw, self.sh, self.content_a, self.compact_a, self.neck_s,
                   self.edge_hide_a, self.edge_hover_a, self.edge_progress):
             if not s.rest:
@@ -1025,6 +1030,15 @@ class Island(QtWidgets.QWidget):
         x0, y0 = (g.left() // q) * q, (g.top() // q) * q
         x1, y1 = -((-(g.right() + 1)) // q) * q, -((-(g.bottom() + 1)) // q) * q
         g = QtCore.QRect(x0, y0, x1 - x0, y1 - y0)
+        if self.remote.active:
+            if self.backdrop.tiny is not None:
+                # 远程模式：不再取背景，也就不会每次把自己临时排除出截图；纹理跟着新区域走。
+                self.backdrop.set_paused(True)
+                if self.backdrop.retarget(g):
+                    self._bd_prev = None
+                    self._bd_target = self.backdrop.state
+                return
+            # 还没有纹理：先取一张种子，下一帧再暂停。
         if moving:
             interval = 1 / 40
         else:
@@ -1036,6 +1050,21 @@ class Island(QtWidgets.QWidget):
                 interval = 1 / (min(fps, 8.0) if theme.mode == "auto" else (1.5 if self.expanded else 1.0))
         need = self.path.boundingRect().toAlignedRect().translated(self._win_origin).intersected(self.scr.geometry())
         self.backdrop.request(self.scr, g, interval, urgent=not self.backdrop.covers(need))
+
+    def _on_remote_changed(self, active: bool):
+        """远程模式开关：暂停 / 恢复毛玻璃取背景，远端画面不再因临时排除自己而闪烁。"""
+        if active and self.backdrop.tiny is not None:
+            # 冻结当前可见的混合画面，正在进行的背景渐变不会跳变。
+            frozen = Backdrop.blend_states(self._bd_prev, self._bd_target,
+                                           self._backdrop_progress(time.perf_counter()))
+            self.backdrop.set_paused(True)
+            self.backdrop.adopt(frozen)
+            self._bd_prev = None
+            self._bd_target = frozen
+        else:
+            self._request_backdrop()      # 先按当前几何刷新请求，恢复后第一张就是对的区域
+            self.backdrop.set_paused(False)
+        self._kick()
 
     def _on_backdrop(self, changed: bool):
         """新截图从当前混合画面接续；同一主题内的连续采样不延后动画终点。"""
@@ -1241,14 +1270,19 @@ class Island(QtWidgets.QWidget):
             if inside or not self.edge_hide_a.rest:
                 return
             self._edge_reveal_wait_leave = False
+        on_btn = inside and self._on_play_button(QtCore.QPointF(QtGui.QCursor.pos()) - QtCore.QPointF(self._win_origin))
         if not self.expanded and self.mode == "anchored" and not self._fs_hidden:
             # 收起时（任何展开方式）：鼠标靠近就把水滴"挤"一下，离开后带回弹地恢复
             # 只有鼠标进入灵动岛范围才挤压；越靠近中心挤压越强（边缘处几乎不变形）。
-            # 靠近但没碰到时只有表情变化（由小形象自己处理），不挤压。
             gp = QtCore.QPointF(QtGui.QCursor.pos())
             lp = gp - QtCore.QPointF(self._win_origin)
             b = self.body
-            if b.contains(lp):
+            if on_btn:
+                # 悬停在播放键上：按钮保持稳定，水滴也不再被挤压
+                if self.poke.target != 0.0:
+                    self.poke.to(0.0, 300, 0.8)
+                    self._kick()
+            elif b.contains(lp):
                 nx = (lp.x() - b.center().x()) / max(1.0, b.width() / 2)
                 ny = (lp.y() - b.center().y()) / max(1.0, b.height() / 2)
                 depth = 1.0 - min(1.0, math.hypot(nx, ny))           # 0 = 边缘，1 = 中心
@@ -1260,20 +1294,19 @@ class Island(QtWidgets.QWidget):
             elif self.poke.target != 0.0:
                 self.poke.to(0.0, 300, 0.22)          # 欠阻尼：弹回时会外鼓几下
                 self._kick()
-        on_btn = inside and self._on_play_button(QtCore.QPointF(QtGui.QCursor.pos()) - QtCore.QPointF(self._win_origin))
         hv = 1.0 if on_btn and not self.passthrough() else 0.0
         if abs(self.compact.play_hover - hv) > 0.01:
             self.compact.play_hover += (hv - self.compact.play_hover) * 0.5
             self._kick()
         if on_btn and not self.expanded:
-            self._hover_since = None              # 在播放键上停留不展开
+            self._hover_since = None              # 悬停在可点击的播放键上：不展开，保证按钮可点
             return
         if inside and self.passthrough() and not self.expanded:
             self._hover_since = None
             return                                # 收起时不悬停展开；手动展开后正常交互
         if inside:
             self._out_since = None
-            if not self.expanded and self.expand_mode() != "never":
+            if not self.expanded and self.expand_mode() in ("hover", "always"):
                 if self._hover_since is None:
                     self._hover_since = now
                 elif (now - self._hover_since) * 1000 >= cfg.get("island.hover_expand_ms", 220) \
@@ -1315,7 +1348,7 @@ class Island(QtWidgets.QWidget):
     def _on_play_button(self, local: QtCore.QPointF) -> bool:
         r = self.compact.play_rect
         return (r is not None and not self.expanded and self.compact.mode() == "media"
-                and r.adjusted(-6, -8, 6, 8).contains(local))
+                and r.adjusted(-10, -10, 10, 10).contains(local))
 
     def mouseReleaseEvent(self, e):
         self.lp_timer.stop()
@@ -1323,9 +1356,17 @@ class Island(QtWidgets.QWidget):
             self._press = None
             self.play_pause_requested.emit()
             return
-        if self._press is not None and self.mode == "anchored" and not self.expanded \
-                and self.expand_mode() != "never":
-            self._click_timer.start(QtWidgets.QApplication.doubleClickInterval())
+        if self._press is not None and self.mode == "anchored" and not self.expanded:
+            mode = self.expand_mode()
+            if mode == "click":
+                # 点击展开：单击立即展开，不再等双击间隔。
+                # 双击长关仍可在展开后的空白区域使用。
+                self._click_timer.stop()
+                self._press = None
+                self._single_click()
+                return
+            if mode != "never":
+                self._click_timer.start(QtWidgets.QApplication.doubleClickInterval())
         self._press = None
 
     def _single_click(self):
@@ -1387,6 +1428,15 @@ class Island(QtWidgets.QWidget):
         else:
             self._rhook.remove()
 
+    def remote_mode(self) -> str:
+        return self.remote.mode()
+
+    def set_remote_mode(self, mode: str):
+        self.remote.set_mode(mode)
+
+    def apply_remote_mode(self):
+        self.remote.apply_mode()
+
     def capture_visible(self) -> bool:
         return not bool(cfg.get("island.exclude_from_capture", False))
 
@@ -1405,13 +1455,14 @@ class Island(QtWidgets.QWidget):
 
     def expand_mode(self) -> str:
         m = cfg.get("island.expand_mode")
-        if m not in ("hover", "always", "never"):
+        if m not in ("hover", "click", "always", "never"):
             m = "always" if cfg.get("island.pinned", False) else "hover"
         return m
 
     def set_expand_mode(self, mode: str):
-        """hover = 鼠标悬停展开、离开收起；always = 一直展开；never = 一直收起（悬停 / 单击都不展开）。"""
-        if mode not in ("hover", "always", "never"):
+        """hover = 鼠标悬停展开、离开收起；click = 只在点击时展开、离开收起；
+        always = 一直展开；never = 一直收起（悬停 / 单击都不展开）。"""
+        if mode not in ("hover", "click", "always", "never"):
             return
         cfg.set("island.expand_mode", mode, save=False)
         cfg.set("island.pinned", mode == "always")
@@ -1422,6 +1473,10 @@ class Island(QtWidgets.QWidget):
         mode = self.expand_mode()
         if mode == "always":
             self.expand()
+        elif mode == "click":
+            # 切换为点击展开时，鼠标不在岛上就收起，之后由单击唤出
+            if not self._inside(QtGui.QCursor.pos()):
+                self.collapse()
         elif mode == "never":
             # 不立即收起：鼠标离开灵动岛后才收起（之后悬停 / 单击都不再展开）
             self.locks.discard("pin")
@@ -1497,6 +1552,7 @@ class Island(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(600, lambda: self.expand() if not self.edge_hidden else None)
         self.poll.start()
         self.backdrop.start()
+        self.remote.start()
         self._kick()
 
     def set_hotkey(self, name: str, value: str):
@@ -1573,6 +1629,7 @@ class Island(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
         self.backdrop.stop()
+        self.remote.stop()
         self._rhook.remove()
         cfg.save()
         super().closeEvent(e)

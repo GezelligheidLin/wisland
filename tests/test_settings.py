@@ -47,8 +47,31 @@ class SettingsIsland(QtCore.QObject):
     def set_capture_visible(self, on):
         self.config.set("island.exclude_from_capture", not on)
 
+    def remote_mode(self):
+        return self.config.get("island.remote_mode")
+
+    def set_remote_mode(self, mode):
+        self.config.set("island.remote_mode", mode)
+
     def screen(self):
         return QtWidgets.QApplication.primaryScreen()
+
+
+class SettingsUpdates(QtCore.QObject):
+    changed = QtCore.Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._checking = False
+        self.error = False
+        self.checked = False
+        self.latest = None
+        self.check_count = 0
+
+    def check(self):
+        self.check_count += 1
+        self._checking = True
+        self.changed.emit()
 
 
 class _ConfigTests(unittest.TestCase):
@@ -119,6 +142,16 @@ class SettingsWindowTests(_ConfigTests):
         self.assertEqual(combo.currentData(), "sky")
         self.assertEqual(Config().get("island.theme"), "sky")
 
+    def test_remote_mode_dropdown_applies_and_saves_choice(self):
+        self.click(self.window._buttons["外观"])
+        combo = self.control(QtWidgets.QComboBox, "远程模式")
+        self.assertEqual(combo.currentData(), "auto")
+        combo.activated.emit(combo.findData("on"))
+        self.assertEqual(combo.currentData(), "on")
+        self.assertEqual(Config().get("island.remote_mode"), "on")
+        combo.activated.emit(combo.findData("off"))
+        self.assertEqual(Config().get("island.remote_mode"), "off")
+
     def test_at_least_one_tab_is_saved(self):
         self.click(self.window._buttons["标签页"])
         home = self.control(QtWidgets.QCheckBox, "显示主页标签页")
@@ -141,6 +174,50 @@ class SettingsWindowTests(_ConfigTests):
         self.click(self.window._buttons["高级"])
         self.click(self.control(QtWidgets.QPushButton, "重新加载配置"))
         self.reload.assert_called_once_with()
+
+    def test_passthrough_shows_as_expand_mode_and_turns_off_with_others(self):
+        combo = self.control(QtWidgets.QComboBox, "展开方式")
+        self.config.set("island.expand_mode", "click")
+        self.config.set("island.passthrough", True)
+        self.window.refresh()
+        self.assertEqual(combo.currentData(), "pass")
+        self.window._apply(self.window._set_mode, "click")
+        self.assertFalse(self.island.passthrough())
+        self.assertEqual(self.island.expand_mode(), "click")
+        self.assertEqual(combo.currentData(), "click")
+        self.window._apply(self.window._set_mode, "pass")
+        self.assertTrue(self.island.passthrough())
+        self.assertEqual(combo.currentData(), "pass")
+
+    def test_version_and_update_actions_are_in_settings(self):
+        from wisland.services.updates import InstalledRelease, Update
+
+        updates = SettingsUpdates()
+        window = SettingsWindow(self.island, lambda: False, Mock(), Mock(),
+                                installed_release=InstalledRelease("1.2.3"), updates=updates)
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(window.close)
+        window.present()
+        QtTest.QTest.mouseClick(window._buttons["版本与更新"], QtCore.Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+        control = lambda kind, name: next(
+            widget for widget in window.findChildren(kind) if widget.accessibleName() == name)
+        version = control(QtWidgets.QLabel, "当前安装版本号")
+        status = control(QtWidgets.QLabel, "更新检查状态")
+        self.assertEqual(version.text(), "v1.2.3")
+        self.assertEqual(status.text(), "尚未检查")
+        QtTest.QTest.mouseClick(control(QtWidgets.QPushButton, "立即检查更新"),
+                                QtCore.Qt.MouseButton.LeftButton)
+        self.app.processEvents()
+        self.assertEqual(updates.check_count, 1)
+        self.assertEqual(status.text(), "正在检查更新…")
+        updates._checking = False
+        updates.checked = True
+        updates.latest = Update("1.2.4", {"zip": "https://example.test/update.zip"})
+        updates.changed.emit()
+        self.assertEqual(status.text(), "发现新版本 v1.2.4")
+        self.assertTrue(control(QtWidgets.QPushButton, "下载 ZIP").isVisible())
+        self.assertFalse(control(QtWidgets.QPushButton, "下载 EXE").isVisible())
 
 
 class HotkeySettingsTests(_ConfigTests):

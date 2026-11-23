@@ -515,8 +515,9 @@ class WeatherPage(Page):
         self.add_edit.focus_wanted.connect(self.want_focus)
         self.add_edit.returnPressed.connect(self._do_add)
         self.add_edit.installEventFilter(self)
-        refresh = IconButton(G.REFRESH, 28, 12, "重新加载缓存；天气每天最多查询一次")
-        refresh.clicked.connect(lambda: ctx.weather.refresh())
+        refresh = IconButton(G.REFRESH, 28, 12, "重新加载天气；今日查询失败的会重试，已成功的不再重复请求")
+        refresh.clicked.connect(self._refresh_clicked)
+        self.refresh_btn = refresh
         head = QtWidgets.QHBoxLayout()
         head.setSpacing(6)
         head.setContentsMargins(0, 0, 0, 0)
@@ -558,8 +559,45 @@ class WeatherPage(Page):
         self.err = Label("", 13, level=2, align=Qt.AlignmentFlag.AlignCenter, wrap=True)
         self.err.hide()
         self.setLayout(vbox(head, (self.body, 1), self.err, spacing=8))
+        self._manual_refresh = False
+        self._status = QtCore.QTimer(self, singleShot=True, interval=4000)
+        self._status.timeout.connect(self._sync_msg)
         ctx.weather.cities_updated.connect(self.set_cities)
         ctx.weather.city_added.connect(self._added)
+        ctx.weather.busy_changed.connect(self._on_weather_busy)
+        self.refresh_btn.setEnabled(not getattr(ctx.weather, "busy", False))
+
+    # ---------- 刷新 ----------
+    def _refresh_clicked(self):
+        """手动刷新：重试今天失败的请求，并让状态在标题行可见。"""
+        self._status.stop()
+        self._manual_refresh = True
+        if self.ctx.weather.refresh(force=True):
+            self.msg.setText("正在刷新…")
+            self.refresh_btn.setEnabled(False)
+        else:
+            self._manual_refresh = False
+            self.msg.setText("今日已是最新 · 明天自动更新")
+            self._status.start()
+
+    def _on_weather_busy(self, busy: bool):
+        self.refresh_btn.setEnabled(not busy)
+        if not self._manual_refresh:
+            return
+        if busy:
+            self.msg.setText("正在刷新…")
+        else:
+            self._manual_refresh = False
+            self.msg.setText("刷新失败 · 稍后可再试" if self._selected_error() else "已更新")
+            self._status.start()
+
+    def _selected_error(self) -> str:
+        if 0 <= self.sel < len(self.data):
+            return str(self.data[self.sel].get("error") or "")
+        return ""
+
+    def _sync_msg(self):
+        self.msg.setText(self._selected_error())
 
     # ---------- 城市 ----------
     def set_data(self, d: dict):
@@ -610,7 +648,7 @@ class WeatherPage(Page):
             return
         self.err.hide()
         self.body.show()
-        self.msg.setText(d.get("error") or "")
+        self._sync_msg()
         self.icon.set_glyph(weather_glyph(d.get("icon")))
         self.temp.setText(f"{round(d.get('temp', 0))}°")
         self.desc.setText(d.get("desc", ""))

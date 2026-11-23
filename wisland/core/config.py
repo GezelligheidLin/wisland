@@ -28,6 +28,7 @@ DEFAULTS: dict = {
         "hover_expand_ms": 120,
         "collapse_delay_ms": 320,
         "exclude_from_capture": False,  # False = 灵动岛出现在截图 / 录屏里（取背景时只临时排除自己）
+        "remote_mode": "auto",      # 远程模式：auto = 检测到远程控制时暂停毛玻璃刷新 / on = 始终暂停 / off = 不暂停
         "blur_fps": 8,
         "scale": 1.0,
         "default_tab": "home",

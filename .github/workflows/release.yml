@@ -21,6 +21,8 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,16 +41,26 @@ jobs:
       - name: Resolve version
         id: ver
         shell: pwsh
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          WISLAND_OSS_DOWNLOAD_BASE: ${{ vars.WISLAND_OSS_DOWNLOAD_BASE }}
         run: |
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $version = $env:GITHUB_REF_NAME.TrimStart("v")
-          } elseif ("${{ inputs.version }}" -ne "") {
-            $version = "${{ inputs.version }}".TrimStart("v")
+          } elseif ($env:REQUESTED_VERSION) {
+            $version = $env:REQUESTED_VERSION.TrimStart("v")
           } else {
-            $version = "0.0.${{ github.run_number }}"
+            $version = "0.0.$env:GITHUB_RUN_NUMBER"
+          }
+          if ($version -cnotmatch '^(0|[1-9][0-9]{0,8})(\.(0|[1-9][0-9]{0,8})){2}\z') {
+            throw "版本号应为 x.y.z"
           }
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
+          $releaseInfo = Join-Path $env:RUNNER_TEMP "release-info.json"
+          @{ version = $version; download_base = [string]$env:WISLAND_OSS_DOWNLOAD_BASE } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath $releaseInfo -Encoding utf8
+          "WISLAND_RELEASE_INFO=$releaseInfo" >> $env:GITHUB_ENV
 
       - name: Build (onedir + onefile)
         run: pyinstaller --noconfirm --clean packaging/wisland.spec
@@ -57,6 +69,7 @@ jobs:
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
+          WISLAND_EXPECT_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           $p = Start-Process -FilePath "dist\Wisland\Wisland.exe" -ArgumentList "--self-check" -Wait -PassThru
           if ($p.ExitCode -ne 0) {
@@ -101,3 +114,33 @@ jobs:
           files: |
             dist/wisland-*.zip
             dist/Wisland-*.exe
+
+  mirror-oss:
+    if: ${{ vars.WISLAND_OSS_DOWNLOAD_BASE != '' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: wisland-oss-mirror
+      queue: max
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: wisland-${{ needs.build.outputs.version }}
+          path: release-assets
+      - name: Install OSS SDK
+        run: python -m pip install alibabacloud-oss-v2==1.3.2
+      - name: Publish OSS mirror
+        env:
+          WISLAND_RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          WISLAND_OSS_BUCKET: ${{ vars.WISLAND_OSS_BUCKET }}
+          WISLAND_OSS_REGION: ${{ vars.WISLAND_OSS_REGION }}
+          WISLAND_OSS_UPLOAD_ORIGIN: ${{ vars.WISLAND_OSS_UPLOAD_ORIGIN }}
+          OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        run: python -m scripts.publish_oss

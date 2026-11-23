@@ -2,12 +2,10 @@
 """主页（正在播放 + 快捷操作 + 自定义启动器）与消息页（QQ / 微信 / 钉钉 / 邮件提醒）。"""
 from __future__ import annotations
 
-import os
 import time
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ...core.bg import launch
 from ...core.config import cfg, expand
 from ...services.notify import notification_summary
 from ..anim import Spring, clamp
@@ -21,52 +19,182 @@ Qt = QtCore.Qt
 
 # ======================================================================== 播放卡片
 class Progress(QtWidgets.QWidget, Themed):
+    """进度条：悬停出现圆点与时间预览，点击 / 拖拽会平滑滑到目标位置。"""
+
     seek = QtCore.Signal(float)
+    BAR_Y = 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(22)
+        self.setMouseTracking(True)
         self.pos_ = 0.0
         self.dur = 0.0
         self.stamp = 0.0
         self.playing = False
         self.hover = 0.0
+        self.fill = Spring(0.0, 320.0, 1.0, 0.0006)   # 显示用的进度（0..1），弹簧跟随
+        self._drag = False
+        self._drag_frac = 0.0
+        self._hover_frac: float | None = None
+        self._pending: float | None = None            # 拖拽 / 点击后等待播放器回报的新位置
+        self._pending_until = 0.0
+        self._t = QtCore.QTimer(self, interval=16, timeout=self._tick)
+        self._last = time.perf_counter()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._hook_theme()
 
+    # --- 状态 ---
     def set_state(self, m: dict):
-        self.pos_ = float(m.get("position") or 0)
-        self.dur = float(m.get("duration") or 0)
-        self.stamp = float(m.get("stamp") or time.monotonic())
-        self.playing = bool(m.get("playing"))
+        now = time.monotonic()
+        pos = float(m.get("position") or 0)
+        dur = float(m.get("duration") or 0)
+        stamp = float(m.get("stamp") or now)
+        playing = bool(m.get("playing"))
+        pending = self._pending is not None
+        if pending and dur > 0:
+            tgt = self._pending * dur
+            # 播放器还没追上拖拽的位置时，继续显示目标位置，避免进度条先弹回去再跳回来
+            if now < self._pending_until and abs(pos - tgt) > max(1.5, dur * 0.01):
+                pos = tgt
+                stamp = now
+            else:
+                self._pending = None
+                pending = False
+        if dur <= 0:
+            self._pending = None
+            self.fill.snap(0.0)
+        elif not pending and not self._drag:
+            jump = self.dur <= 0 or abs(dur - self.dur) > 1.0 or abs(pos - self.pos_) > 8.0
+            if jump:                                  # 换歌 / 大跳转：直接落到新位置
+                self.fill.snap(clamp(pos / dur, 0, 1))
+        self.pos_ = pos
+        self.dur = dur
+        self.stamp = stamp
+        self.playing = playing
+        self._ensure_tick()
         self.update()
 
     def current(self) -> float:
+        if self._drag:
+            return self._drag_frac * self.dur
+        if self._pending is not None:
+            return self._pending * self.dur           # 等待播放器确认新位置时，不显示旧进度
         p = self.pos_ + ((time.monotonic() - self.stamp) if self.playing else 0)
         return clamp(p, 0, self.dur) if self.dur else p
 
-    def mouseReleaseEvent(self, e):
-        if self.dur > 0:
-            self.seek.emit(clamp(e.position().x() / max(1, self.width()), 0, 1) * self.dur)
+    def _frac(self) -> float:
+        if self.dur <= 0:
+            return 0.0
+        if self._drag:
+            return self._drag_frac
+        if self._pending is not None:
+            return self._pending
+        return clamp(self.current() / self.dur, 0, 1)
 
+    def _ensure_tick(self):
+        if not self.isVisible():
+            return
+        if not self._t.isActive():
+            self._last = time.perf_counter()
+            self._t.start()
+
+    def _tick(self):
+        now = time.perf_counter()
+        dt = min(0.05, max(0.001, now - self._last))
+        self._last = now
+        self.fill.to(self._frac(), 720.0 if self._drag else 320.0, 1.0)
+        self.fill.step(dt)
+        self.update()
+        if self.fill.rest and not self.playing and not self._drag:
+            self._t.stop()
+
+    # --- 交互 ---
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton or self.dur <= 0 or not self.isEnabled():
+            return
+        self._drag = True
+        self._hover_frac = clamp(e.position().x() / max(1, self.width()), 0, 1)
+        self._drag_frac = self._hover_frac
+        self._ensure_tick()
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        if self.dur <= 0 or not self.isEnabled():
+            return
+        frac = clamp(e.position().x() / max(1, self.width()), 0, 1)
+        self._hover_frac = frac
+        if self._drag:
+            self._drag_frac = frac
+            self._ensure_tick()
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if not self._drag:
+            return
+        self._drag = False
+        frac = self._drag_frac
+        self._pending = frac
+        self._pending_until = time.monotonic() + 1.6
+        self.seek.emit(frac * self.dur)
+        self._ensure_tick()
+        self.update()
+
+    def leaveEvent(self, e):
+        if not self._drag:
+            self._hover_frac = None
+            self.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._last = time.perf_counter()
+        self._t.start()
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._t.stop()
+        self._hover_frac = None
+
+    # --- 绘制 ---
     def paintEvent(self, e):
         p = painter(self)
         r = QtCore.QRectF(self.rect())
-        y = 6
-        th = 4 + 3 * self.hover
-        tr = QtCore.QRectF(0, y - th / 2, r.width(), th)
+        y = self.BAR_Y
+        th = 4 + 3 * self.hover + (1.5 if self._drag else 0.0)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(theme.track())
-        p.drawRoundedRect(tr, th / 2, th / 2)
-        cur = self.current()
+        p.drawRoundedRect(QtCore.QRectF(0, y - th / 2, r.width(), th), th / 2, th / 2)
+
+        frac = clamp(self.fill.x, 0, 1)
         if self.dur > 0:
             p.setBrush(theme.text(0.85 + 0.15 * self.hover))
-            p.drawRoundedRect(QtCore.QRectF(0, y - th / 2, max(th, r.width() * cur / self.dur), th), th / 2, th / 2)
+            p.drawRoundedRect(QtCore.QRectF(0, y - th / 2, max(th, r.width() * frac), th), th / 2, th / 2)
+
+        # 悬停 / 拖拽：目标位置的预览刻度与圆点
+        if self.dur > 0 and self._hover_frac is not None:
+            hx = r.width() * self._hover_frac
+            p.setBrush(theme.text(0.3))
+            p.drawRoundedRect(QtCore.QRectF(hx - 0.75, y - th / 2 - 3, 1.5, th + 6), 0.75, 0.75)
+            p.setBrush(theme.text(0.45))
+            p.drawEllipse(QtCore.QPointF(hx, y), 2.6, 2.6)
+
+        # 拖拽时拇指跟随动画后的位置
+        if self.dur > 0 and self._drag:
+            cx = r.width() * frac
+            rad = 3.4 + 1.6 * self.hover + 1.2
+            p.setBrush(theme.text(0.14))
+            p.drawEllipse(QtCore.QPointF(cx, y), rad + 3.0, rad + 3.0)
+            p.setBrush(theme.text(0.92))
+            p.drawEllipse(QtCore.QPointF(cx, y), rad, rad)
+
         p.setFont(ui_font(10.5, num=True))
         p.setPen(theme.text3())
-        p.drawText(QtCore.QRectF(0, 10, 60, 12), Qt.AlignmentFlag.AlignLeft, fmt_time(cur))
+        p.drawText(QtCore.QRectF(0, 10, 60, 12), Qt.AlignmentFlag.AlignLeft, fmt_time(self.current()))
         if self.dur > 0:
-            p.drawText(QtCore.QRectF(r.width() - 60, 10, 60, 12), Qt.AlignmentFlag.AlignRight, fmt_time(self.dur))
+            preview = self._hover_frac is not None and not self._drag
+            right = self._hover_frac * self.dur if preview else self.dur
+            p.setPen(theme.text2() if preview else theme.text3())
+            p.drawText(QtCore.QRectF(r.width() - 60, 10, 60, 12), Qt.AlignmentFlag.AlignRight, fmt_time(right))
 
 
 class CoverView(QtWidgets.QWidget):
@@ -78,6 +206,7 @@ class CoverView(QtWidgets.QWidget):
         self.glow = QtGui.QColor(255, 255, 255, 0)
         self.h = 0.0
         self.setFixedSize(size + 12, size + 12)
+        theme.changed.connect(self.update)
 
     def set_pixmap(self, pm, glow: QtGui.QColor | None):
         self.pm = pm
@@ -103,81 +232,30 @@ class CoverView(QtWidgets.QWidget):
             p.drawEllipse(r.adjusted(-8, -4, 8, 14))
         if self.pm is not None:
             p.drawPixmap(r.toRect(), self.pm)
-
-
-class CoverTitle(QtWidgets.QWidget):
-    """封面在上方居中（正对播放键），标题压在封面下沿、向两侧延伸，但不超出播放卡片。"""
-    COVER = 58
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.pm: QtGui.QPixmap | None = None
-        self.glow = QtGui.QColor(255, 255, 255, 0)
-        self.h = 0.0
-        self.title = "未在播放"
-        self.sub = ""
-        self.setFixedHeight(self.COVER + 30)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
-        theme.changed.connect(self.update)
-
-    def set_pixmap(self, pm, glow):
-        self.pm = pm
-        self.glow = glow or QtGui.QColor(255, 255, 255, 0)
-        self.update()
-
-    def set_text(self, title, sub):
-        self.title, self.sub = title, sub
-        self.update()
-
-    def paintEvent(self, e):
-        p = painter(self)
-        W_ = self.width()
-        s = 1.0 + 0.07 * self.h
-        size = self.COVER * s
-        cr = QtCore.QRectF(0, 0, size, size)
-        cr.moveCenter(QtCore.QPointF(W_ / 2, 4 + self.COVER / 2 - 2.5 * self.h))
-        if self.h > 0.01 and self.glow.alpha():
-            g = QtGui.QRadialGradient(cr.center() + QtCore.QPointF(0, 6), cr.width() * 0.8)
-            c1 = QtGui.QColor(self.glow)
-            c1.setAlpha(round(150 * self.h))
-            c2 = QtGui.QColor(self.glow)
-            c2.setAlpha(0)
-            g.setColorAt(0, c1)
-            g.setColorAt(1, c2)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(g)
-            p.drawEllipse(cr.adjusted(-10, -6, 10, 14))
-        if self.pm is not None:
-            p.drawPixmap(cr.toRect(), self.pm)
-        # 标题：压住封面下沿，左右延伸（限制在卡片内），底下垫一块半透明玻璃保证可读
-        f = ui_font(13.5, W.DemiBold)
-        fm = QtGui.QFontMetrics(f)
-        text = self.title + (f"  ·  {self.sub}" if self.sub else "")
-        maxw = W_ - 16
-        text = fm.elidedText(text, Qt.TextElideMode.ElideRight, int(maxw - 20))
-        tw = fm.horizontalAdvance(text) + 20
-        tr = QtCore.QRectF((W_ - tw) / 2, cr.bottom() - 12, tw, fm.height() + 8)
-        p.setFont(f)
-        sh = QtGui.QColor(0, 0, 0, 120) if theme.dark else QtGui.QColor(255, 255, 255, 170)
-        p.setPen(sh)
-        for dx, dy in ((0, 1), (1, 0), (-1, 0), (0, -1)):
-            p.drawText(tr.translated(dx, dy), Qt.AlignmentFlag.AlignCenter, text)
-        p.setPen(theme.text())
-        p.drawText(tr, Qt.AlignmentFlag.AlignCenter, text)
+            return
+        # 空封面：按当前主题实时画占位块，主题切换后不会残留旧配色
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(theme.text(0.055))
+        p.drawRoundedRect(r, r.width() * 0.225, r.width() * 0.225)
+        p.setFont(icon_font(r.width() * 0.6))
+        p.setPen(theme.text(0.42))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, G.MUSIC)
 
 
 class MediaCard(Card):
+    """正在播放：左边大封面，中间曲目信息，右侧控制键，进度条整行铺开。"""
+
     def __init__(self, ctx, parent=None):
-        super().__init__(parent, 20)
+        super().__init__(parent, 18, alpha=0.9)
         self.ctx = ctx
         self.cover_px: QtGui.QPixmap | None = None
-        self.cover = CoverTitle(self)
+        self.cover = CoverView(64)
         self._hov = Spring(0, 260, 0.6, 0.004)
         self._ht = QtCore.QTimer(self, interval=16, timeout=self._hover_tick)
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
-        self.title = Label("未在播放", 15, W.DemiBold)
+        self.title = Label("未在播放", 17, W.DemiBold)
         self.artist = Label("", 12.5, level=2)
-        self.app = Label("", 11, level=3)
+        self.app = Label("", 11.5, level=3)
         self.prog = Progress()
         self.prev = IconButton(G.PREV, 34, 15, "上一首")
         self.play = IconButton(G.PLAY, 40, 18, "播放 / 暂停", filled=True)
@@ -189,12 +267,12 @@ class MediaCard(Card):
         self.prog.seek.connect(lambda s: ctx.media.seek(s))
         self.open_btn.clicked.connect(self._open_player)
         self.open_btn.hide()
-        self.title.hide()
         self.artist.hide()
         self.app.hide()
-        ctrls = hbox(None, self.prev, self.play, self.next, None, spacing=8)   # 播放键正对封面
-        self.setLayout(vbox(self.cover, self.prog, ctrls, None, spacing=0, margins=(10, 6, 10, 6)))
-        self._tick = QtCore.QTimer(self, interval=500, timeout=self.prog.update)
+        info = vbox(None, self.title, self.artist, self.app, None, spacing=3)
+        ctrls = hbox(self.prev, self.play, self.next, spacing=10)
+        top = hbox(self.cover, (info, 1), ctrls, spacing=14, margins=(4, 0, 8, 0))
+        self.setLayout(vbox(top, self.prog, spacing=2, margins=(10, 8, 12, 8)))
         self._set_cover(None)
 
     # --- 悬停动画 ---
@@ -217,10 +295,6 @@ class MediaCard(Card):
         if self._hov.rest:
             self._ht.stop()
 
-    def paintEvent(self, e):
-        """不画独立背景，直接嵌在灵动岛玻璃上（悬停时封面 / 进度条有动画）。"""
-        return
-
     def _open_player(self):
         items = cfg.get("launcher") or []
         it = next((i for i in items if "cloudmusic" in str(i.get("path", "")).lower()), items[0] if items else None)
@@ -228,27 +302,13 @@ class MediaCard(Card):
             self.ctx.windows.open_or_focus(expand(it["path"]), it.get("exe"))
 
     def _set_cover(self, img):
-        px = rounded_pixmap(img, 58, 13) if img is not None else None
+        px = rounded_pixmap(img, 64, 15) if img is not None else None
         glow = None
         if img is not None:
             q = img if isinstance(img, QtGui.QImage) else img.toImage()
             glow = q.scaled(1, 1, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation).pixelColor(0, 0)
             h, s_, v, _ = glow.getHsv()
             glow = QtGui.QColor.fromHsv(max(0, h), min(255, int(s_ * 1.4) + 40), max(170, v))
-        if px is None:
-            pm = QtGui.QPixmap(116, 116)
-            pm.fill(Qt.GlobalColor.transparent)
-            p = QtGui.QPainter(pm)
-            p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(theme.card(1.6))
-            p.drawRoundedRect(QtCore.QRectF(0, 0, 116, 116), 26, 26)
-            p.setFont(icon_font(44))
-            p.setPen(theme.text(0.6))
-            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, G.MUSIC)
-            p.end()
-            pm.setDevicePixelRatio(2)
-            px = pm
         self.cover.set_pixmap(px, glow)
 
     def set_cover(self, img):
@@ -256,27 +316,36 @@ class MediaCard(Card):
 
     def set_media(self, m: dict):
         has = bool(m.get("has_session") and m.get("title"))
-        self.cover.set_text(m.get("title") or "未在播放", m.get("artist") or "")
+        title = (m.get("title") or "").strip()
+        artist = (m.get("artist") or "").strip()
+        app = (m.get("app_name") or "").strip()
+        self.title.setText(title or "未在播放")
+        self.artist.setText(artist)
+        self.artist.setVisible(bool(artist))
+        if has:
+            self.app.setText(app)
+            self.app.setVisible(bool(app) and app != artist)
+        else:
+            self.app.setText("在播放器中播放后自动显示")
+            self.app.setVisible(True)
         self.play.set_glyph(G.PAUSE if m.get("playing") else G.PLAY)
         self.prog.set_state(m)
         self.prog.setVisible(True)
         self.prog.setEnabled(has and (m.get("duration") or 0) > 0)
         # 按钮始终可用：没有媒体会话（播放器没接入系统媒体控件）时会改发键盘媒体键
 
-        if m.get("playing"):
-            self._tick.start()
-        else:
-            self._tick.stop()
-
 
 # ======================================================================== 快捷操作 / 启动器
 class Action(Hoverable):
+    """快捷操作：图标 + 文字横向排列，四个等分一行。"""
     def __init__(self, glyph: str, title: str, parent=None):
         super().__init__(parent)
         self.glyph = glyph
         self.title = title
         self.on = False
-        self.setFixedHeight(58)
+        self.setFixedHeight(46)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.setToolTip(title)
 
     def set_on(self, on: bool, glyph: str | None = None, title: str | None = None):
         self.on = on
@@ -284,6 +353,7 @@ class Action(Hoverable):
             self.glyph = glyph
         if title:
             self.title = title
+            self.setToolTip(title)
         self.update()
 
     def paintEvent(self, e):
@@ -298,176 +368,28 @@ class Action(Hoverable):
             c.setAlphaF(c.alphaF() * self._hover.x)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(c)
-            p.drawRoundedRect(r, 16, 16)
-        col = theme.on_color() if self.on else theme.text(0.9)
-        p.setFont(icon_font(18))
-        p.setPen(col)
-        p.drawText(QtCore.QRectF(r.x(), r.y() + 6, r.width(), 26), Qt.AlignmentFlag.AlignCenter, self.glyph)
-        p.setFont(ui_font(11.5, W.DemiBold if self.on else W.Medium))
+            p.drawRoundedRect(r, 14, 14)
+        f = ui_font(12.5, W.DemiBold if self.on else W.Medium)
+        fm = QtGui.QFontMetrics(f)
+        tw = fm.horizontalAdvance(self.title)
+        iw, gap = 18.0, 7.0
+        x0 = r.center().x() - (iw + gap + tw) / 2
+        p.setFont(icon_font(16))
+        p.setPen(theme.on_color() if self.on else theme.text(0.9))
+        p.drawText(QtCore.QRectF(x0, r.y(), iw, r.height()), Qt.AlignmentFlag.AlignCenter, self.glyph)
+        p.setFont(f)
         p.setPen(theme.on_color() if self.on else theme.text2())
-        p.drawText(QtCore.QRectF(r.x(), r.y() + 32, r.width(), 18), Qt.AlignmentFlag.AlignCenter, self.title)
-
-
-_icon_provider = None
-
-
-def file_icon(path: str, size: int = 64) -> QtGui.QPixmap | None:
-    global _icon_provider
-    if _icon_provider is None:
-        _icon_provider = QtWidgets.QFileIconProvider()
-    if not path or not os.path.exists(path):
-        return None
-    ic = _icon_provider.icon(QtCore.QFileInfo(path))
-    pm = ic.pixmap(size, size)
-    return None if pm.isNull() else pm
-
-
-_appx_cache: dict[str, str] = {}
-
-
-def resolve_appx(spec: str, cb):
-    """"appx:包名/相对路径" -> 安装目录下的文件路径（后台查询，结果缓存）。"""
-    from ...core.bg import run_bg, run_hidden
-    name, _, rel = spec[5:].partition("/")
-    if name in _appx_cache:
-        cb(os.path.join(_appx_cache[name], rel))
-        return
-
-    def q():
-        r = run_hidden(["powershell", "-NoProfile", "-Command", f"(Get-AppxPackage -Name '{name}').InstallLocation"])
-        return (r.stdout or b"").decode("utf-8", "ignore").strip().splitlines()[0] if r.stdout else ""
-
-    def done(loc):
-        if loc:
-            _appx_cache[name] = loc
-            cb(os.path.join(loc, rel))
-    run_bg(q, on_done=done)
-
-
-class LaunchIcon(Hoverable):
-    def __init__(self, item: dict, opener=None, parent=None):
-        super().__init__(parent)
-        self.item = item
-        self.opener = opener
-        self.path = expand(item.get("path", ""))
-        icon_spec = item.get("icon", "")
-        self.pm = None
-        if str(icon_spec).startswith("appx:"):
-            resolve_appx(icon_spec, self._set_icon)
-        else:
-            self.pm = file_icon(expand(icon_spec) or self.path)
-        self.setFixedSize(44, 44)
-        self.setToolTip(item.get("name", os.path.basename(self.path)))
-        self.clicked.connect(self.run)
-
-    def _set_icon(self, path):
-        self.pm = file_icon(path)
-        self.update()
-
-    def run(self):
-        args = self.item.get("args") or []
-        if isinstance(args, str):
-            args = args.split()
-        if self.opener is not None:
-            self.opener(self.path, self.item.get("exe"), args)
-        else:
-            launch(self.path, args)
-
-    def paintEvent(self, e):
-        p = painter(self)
-        r = QtCore.QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        s = self.press_scale() * (1 + 0.06 * self._hover.x)
-        p.translate(r.center())
-        p.scale(s, s)
-        p.translate(-r.center())
-        if self._hover.x > 0.01:
-            c = theme.hover()
-            c.setAlphaF(c.alphaF() * self._hover.x)
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(c)
-            p.drawRoundedRect(r, 12, 12)
-        if self.pm is not None:
-            ir = QtCore.QRectF(r.center().x() - 14, r.center().y() - 14, 28, 28)
-            p.drawPixmap(ir.toRect(), self.pm)
-        else:
-            p.setFont(ui_font(15, W.Bold))
-            p.setPen(theme.text(0.8))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, (self.item.get("name") or "?")[:1])
-
-
-class PetWidget(QtWidgets.QWidget):
-    """主页中间的大号小形象：眼睛跟随光标，鼠标靠近时开心。"""
-    def __init__(self, parent=None, scale: float = 2.3):
-        super().__init__(parent)
-        from ..compact import PetFace
-        self.face = PetFace()
-        self.scale = scale
-        self.setMinimumWidth(round(64 * scale))
-        self._t = QtCore.QTimer(self, interval=16, timeout=self.update)
-        self._t.setTimerType(Qt.TimerType.PreciseTimer)
-        theme.changed.connect(self.update)
-
-    def showEvent(self, e):
-        self._t.start()
-
-    def hideEvent(self, e):
-        self._t.stop()
-
-    def paintEvent(self, e):
-        p = painter(self)
-        c = QtCore.QRectF(self.rect()).center()
-        gc = QtCore.QPointF(self.mapToGlobal(c.toPoint()))
-        look = QtCore.QPointF(QtGui.QCursor.pos()) - gc
-        near = self.rect().adjusted(-24, -24, 24, 24).contains(self.mapFromGlobal(QtGui.QCursor.pos()))
-        self.face.paint(p, c.x(), c.y() - 4, self.scale, 1.0, look, near)
-
-
-class LaunchStrip(QtWidgets.QScrollArea):
-    """启动器横条：应用多到放不下时，滚轮横向平滑滚动（不显示滚动条）。"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setWidgetResizable(True)
-        self.setFixedHeight(46)
-        self.viewport().setAutoFillBackground(False)
-        self.setStyleSheet("QScrollArea{background:transparent;border:none}")
-        self.viewport().setStyleSheet("background:transparent")
-        self.inner = QtWidgets.QWidget()
-        self.inner.setObjectName("stripInner")
-        self.inner.setStyleSheet("#stripInner{background:transparent}")
-        self.setWidget(self.inner)
-        self.inner.setAutoFillBackground(False)
-        self.row = QtWidgets.QHBoxLayout(self.inner)
-        self.row.setContentsMargins(0, 0, 0, 0)
-        self.row.setSpacing(2)
-        self._anim = QtCore.QPropertyAnimation(self.horizontalScrollBar(), b"value", self)
-        self._anim.setDuration(220)
-        self._anim.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
-
-    def wheelEvent(self, e):
-        bar = self.horizontalScrollBar()
-        if bar.maximum() <= 0:
-            e.ignore()
-            return
-        d = e.angleDelta().y() or e.angleDelta().x()
-        start = self._anim.endValue() if self._anim.state() == QtCore.QAbstractAnimation.State.Running else bar.value()
-        target = max(0, min(bar.maximum(), int(start) - d))
-        self._anim.stop()
-        self._anim.setStartValue(bar.value())
-        self._anim.setEndValue(target)
-        self._anim.start()
-        e.accept()
+        p.drawText(QtCore.QRectF(x0 + iw + gap, r.y(), tw + 4, r.height()),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self.title)
 
 
 class HomePage(Page):
-    key, glyph, title, height = "home", G.HOME, "主页", 240
+    key, glyph, title, height = "home", G.HOME, "主页", 172
 
     def __init__(self, ctx):
         super().__init__(ctx)
         self.media = MediaCard(ctx)
-        self.media.setFixedHeight(156)
+        self.media.setFixedHeight(116)
         self.a_pin = Action(G.UNPIN, "保持展开")
         self.a_pt = Action(G.POINTER, "可穿透")
         self.a_mute = Action(G.VOLUME, "静音")
@@ -475,37 +397,8 @@ class HomePage(Page):
         self.a_mute.clicked.connect(lambda: ctx.audio.toggle_mute())
         self.a_live.clicked.connect(self._toggle_live)
         ctx.live.running_changed.connect(lambda on: self.a_live.set_on(on, None, "聆听中" if on else "实时字幕"))
-        grid = QtWidgets.QGridLayout()
-        grid.setSpacing(8)
-        grid.addWidget(self.a_pin, 0, 0)
-        grid.addWidget(self.a_pt, 0, 1)
-        grid.addWidget(self.a_mute, 1, 0)
-        grid.addWidget(self.a_live, 1, 1)
-        gw = QtWidgets.QWidget()
-        gw.setLayout(grid)
-        gw.setFixedWidth(150)
-        self.strip = LaunchStrip()
-        self.launch_row = self.strip.row
-        self.build_launcher()
-        self.pet = PetWidget()
-        # 播放卡贴左、四个按钮贴右，各自收窄；中间整块留给小形象
-        self.media.setFixedWidth(200)
-        lay = vbox(hbox(self.media, (self.pet, 1), gw, spacing=12), self.strip, spacing=8)
-        self.setLayout(lay)
-
-    def build_launcher(self):
-        while self.launch_row.count():
-            it = self.launch_row.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-        for item in cfg.get("launcher") or []:
-            self.launch_row.addWidget(LaunchIcon(item, self._open))
-        self.launch_row.addStretch(1)
-
-    def _open(self, path, exe=None, args=None):
-        res = self.ctx.windows.open_or_focus(path, exe, args)
-        if res == "focused" and self.island:
-            self.island.collapse()
+        acts = hbox((self.a_pin, 1), (self.a_pt, 1), (self.a_mute, 1), (self.a_live, 1), spacing=8)
+        self.setLayout(vbox(self.media, acts, spacing=10))
 
     def _toggle_live(self):
         self.ctx.live.toggle()

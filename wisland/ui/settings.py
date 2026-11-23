@@ -1,6 +1,7 @@
 """Wisland 的独立设置窗口；改动复用灵动岛现有的设置入口。"""
 from __future__ import annotations
 
+import ctypes
 import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -93,7 +94,7 @@ class _Card(QtWidgets.QWidget):
         return bool(visible_rules)
 
 
-class SettingsWindow(QtWidgets.QWidget):
+class SettingsWindow(QtWidgets.QDialog):
     """非模态设置窗口，可从菜单和齿轮复用同一个实例。"""
 
     CATEGORIES = {
@@ -102,15 +103,24 @@ class SettingsWindow(QtWidgets.QWidget):
         "标签页": (G.APPS, "顶栏标签等距排列，至少保留一项。隐藏待办后仍可从托盘打开，提醒继续运行。"),
         "快捷键": (G.BOLT, "为常用操作设置 Windows 全局快捷键。"),
         "待办": (G.TODO, "管理本机待办的提醒方式。"),
+        "版本与更新": (G.REFRESH, "查看当前版本、检查新版本和下载更新。"),
         "高级": (G.SLIDERS, "管理天气服务、配置文件和本地数据。"),
     }
-    MODES = [("hover", "悬停展开"), ("always", "常驻展开"), ("never", "长关")]
+    MODES = [("hover", "悬停展开"), ("click", "点击展开"), ("always", "常驻展开"),
+             ("pass", "可穿透"), ("never", "长关")]
+    REMOTE_MODES = [("auto", "自动检测"), ("on", "始终开启"), ("off", "关闭")]
 
-    def __init__(self, island, autostart_enabled, set_autostart, reload_config):
-        super().__init__()
+    def __init__(self, island, autostart_enabled, set_autostart, reload_config,
+                 installed_release=None, updates=None):
+        parent = island if isinstance(island, QtWidgets.QWidget) else None
+        super().__init__(parent)
+        self.setModal(False)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self._island = island
         self._autostart_enabled = autostart_enabled
         self._reload_config = reload_config
+        self._installed_release = installed_release
+        self._updates = updates
         self._section = "常规"
         self._cards = []
         self._buttons = {}
@@ -118,6 +128,9 @@ class SettingsWindow(QtWidgets.QWidget):
         self._bindings = []
         self._tab_switches = {}
         self._hotkey_buttons = {}
+        self._update_status = None
+        self._update_check_button = None
+        self._update_download_buttons = {}
 
         self.setObjectName("settings")
         self.setWindowTitle("Wisland 设置")
@@ -190,6 +203,9 @@ class SettingsWindow(QtWidgets.QWidget):
         self._apply_style(hints.colorScheme())
         self._select("常规")
         self.refresh()
+        if self._updates is not None:
+            self._updates.changed.connect(self._refresh_update_status)
+            self._refresh_update_status()
         self.setFocus()
 
     def present(self):
@@ -198,13 +214,22 @@ class SettingsWindow(QtWidgets.QWidget):
             screen = self._island.screen().availableGeometry()
             self.resize(min(self.width(), screen.width() - 32), min(self.height(), screen.height() - 60))
             self.move(screen.center() - self.rect().center())
-        if self.isMinimized():
-            self.showNormal()
-        else:
-            self.show()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setWindowState(Qt.WindowState.WindowNoState)
+        self.show()
+        if self.windowHandle() is not None:
+            self.windowHandle().setVisible(True)
         self.refresh()
         self.raise_()
         self.activateWindow()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
+        user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+        hwnd = ctypes.c_void_p(int(self.winId()))
+        user32.ShowWindow(hwnd, 5)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
 
     def refresh(self):
         """同步配置及主页快捷操作，不触发新的写入。"""
@@ -257,8 +282,9 @@ class SettingsWindow(QtWidgets.QWidget):
         startup = self._card("常规", "启动")
         self._toggle(startup, "开机自启", "登录 Windows 时自动启动 Wisland。", self._autostart_enabled, set_autostart)
         behavior = self._card("常规", "交互")
-        self._choice(behavior, "展开方式", "决定灵动岛是悬停展开、常驻展开，还是保持收起。",
-                     self.MODES, island.expand_mode, island.set_expand_mode)
+        self._choice(behavior, "展开方式",
+                     "悬停展开 / 点击展开 / 常驻展开 / 可穿透 / 长关。可穿透时收起态鼠标直接穿过灵动岛，仍可用热键、托盘或右键菜单打开。",
+                     self.MODES, self._mode_value, self._set_mode)
         self._toggle(behavior, "可穿透", "收起时让鼠标操作穿过灵动岛，仍可通过右键打开菜单。",
                      island.passthrough, island.set_passthrough)
 
@@ -267,6 +293,8 @@ class SettingsWindow(QtWidgets.QWidget):
                      THEME_NAMES, lambda: cfg.get("island.theme"), self._set_theme)
         self._toggle(appearance, "参与截图", "允许在系统截图和录屏中显示灵动岛。",
                      island.capture_visible, island.set_capture_visible)
+        self._choice(appearance, "远程模式", "被远程控制时暂停毛玻璃实时刷新，避免灵动岛在远端画面里闪烁；期间玻璃保持最后一张背景。",
+                     self.REMOTE_MODES, island.remote_mode, island.set_remote_mode)
 
         tabs = self._card("标签页", "显示标签页")
         descriptions = {
@@ -296,6 +324,33 @@ class SettingsWindow(QtWidgets.QWidget):
         todos = self._card("待办", "提醒")
         self._toggle(todos, "弹出待办提醒", "灵动岛只提示数量。关闭后，仍可在待办清单查看到期提醒。",
                      lambda: bool(cfg.get("todo.popup", True)), lambda on: cfg.set("todo.popup", on))
+
+        updates = self._card("版本与更新", "Wisland 更新")
+        version = self._installed_release.version if self._installed_release else "开发版本"
+        version_label = QtWidgets.QLabel(f"v{version}")
+        version_label.setAccessibleName("当前安装版本号")
+        updates.add_row("当前版本", "当前运行的 Wisland 版本。", version_label)
+        self._update_status = QtWidgets.QLabel("尚未检查" if self._updates else "更新检查不可用")
+        self._update_status.setAccessibleName("更新检查状态")
+        updates.add_row("更新状态", "显示最近一次检查结果。", self._update_status)
+        self._update_check_button = QtWidgets.QPushButton("立即检查")
+        self._update_check_button.setAccessibleName("立即检查更新")
+        self._update_check_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_check_button.clicked.connect(self._check_updates)
+        updates.add_row("检查更新", "查询是否有可用的新版本。", self._update_check_button)
+        download_row = QtWidgets.QWidget()
+        download_layout = QtWidgets.QHBoxLayout(download_row)
+        download_layout.setContentsMargins(0, 0, 0, 0)
+        download_layout.setSpacing(6)
+        for kind, title in (("zip", "下载 ZIP"), ("exe", "下载 EXE"), ("github", "GitHub 发布页")):
+            button = QtWidgets.QPushButton(title)
+            button.setAccessibleName(title)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, kind=kind: self._open_update_download(kind))
+            download_layout.addWidget(button)
+            self._update_download_buttons[kind] = button
+        updates.add_row("下载更新", "发现新版本后，可选择国内 OSS 安装包或 GitHub 发布页。", download_row)
+        self._refresh_update_status()
 
         weather = self._card("高级", "天气服务")
         key_input = QtWidgets.QLineEdit()
@@ -331,6 +386,47 @@ class SettingsWindow(QtWidgets.QWidget):
             self._search.clear()
         self._update_view()
 
+    def _check_updates(self):
+        if self._updates is not None:
+            self._updates.check()
+
+    def _refresh_update_status(self):
+        if self._update_status is None:
+            return
+        if self._updates is None:
+            status = "更新检查不可用"
+            downloads = {}
+            github_url = ""
+        elif self._updates._checking:
+            status = "正在检查更新…"
+            downloads = {}
+            github_url = ""
+        elif self._updates.error:
+            status = "检查失败，请检查网络后重试。"
+            downloads = {}
+            github_url = ""
+        elif self._updates.latest is not None:
+            update = self._updates.latest
+            status = f"发现新版本 v{update.version}"
+            downloads = update.downloads
+            github_url = update.github_url
+        else:
+            status = "当前已是最新版本" if self._updates.checked else "尚未检查"
+            downloads = {}
+            github_url = ""
+        self._update_status.setText(status)
+        if self._update_check_button is not None:
+            self._update_check_button.setEnabled(self._updates is not None and not self._updates._checking)
+        urls = {**downloads, "github": github_url}
+        for kind, button in self._update_download_buttons.items():
+            button.setVisible(bool(urls.get(kind)))
+
+    def _open_update_download(self, kind):
+        update = self._updates.latest if self._updates is not None else None
+        url = update.github_url if kind == "github" and update else update.downloads.get(kind) if update else None
+        if url:
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
     def _update_view(self):
         terms = self._search.text().casefold().split()
         self._title.setText("搜索结果" if terms else self._section)
@@ -356,6 +452,20 @@ class SettingsWindow(QtWidgets.QWidget):
     def _set_theme(self, mode):
         cfg.set("island.theme", mode)
         theme.set_mode(mode)
+
+    def _mode_value(self):
+        """展开方式下拉：可穿透优先显示为一个独立模式，避免开关开着时仍显示点击展开。"""
+        return "pass" if self._island.passthrough() else self._island.expand_mode()
+
+    def _set_mode(self, mode):
+        if mode == "pass":
+            if self._island.expand_mode() == "always":
+                self._island.set_expand_mode("hover")   # 退出常驻，穿透才对收起态生效
+            self._island.set_passthrough(True)
+            return
+        if self._island.passthrough():
+            self._island.set_passthrough(False)
+        self._island.set_expand_mode(mode)
 
     @staticmethod
     def _save_weather_api_key(value):
