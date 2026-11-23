@@ -7,6 +7,7 @@ import os
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core.config import CONFIG_PATH, DATA_DIR, cfg
+from ..services.translate import SOURCE_LANGUAGES, TARGET_LANGUAGES, save_translation_language
 from .theme import G, THEME_NAMES, theme, ui_font
 from .widgets import ChoiceBox, glyph_pixmap
 
@@ -103,8 +104,8 @@ class SettingsWindow(QtWidgets.QDialog):
         "标签页": (G.APPS, "顶栏标签等距排列，至少保留一项。隐藏待办后仍可从托盘打开，提醒继续运行。"),
         "快捷键": (G.BOLT, "为常用操作设置 Windows 全局快捷键。"),
         "待办": (G.TODO, "管理本机待办的提醒方式。"),
+        "高级": (G.SLIDERS, "管理天气、翻译、实时字幕、配置文件和本地数据。"),
         "版本与更新": (G.REFRESH, "查看当前版本、检查新版本和下载更新。"),
-        "高级": (G.SLIDERS, "管理天气服务、配置文件和本地数据。"),
     }
     MODES = [("hover", "悬停展开"), ("click", "点击展开"), ("always", "常驻展开"),
              ("pass", "可穿透"), ("never", "长关")]
@@ -112,10 +113,9 @@ class SettingsWindow(QtWidgets.QDialog):
 
     def __init__(self, island, autostart_enabled, set_autostart, reload_config,
                  installed_release=None, updates=None):
-        parent = island if isinstance(island, QtWidgets.QWidget) else None
-        super().__init__(parent)
+        # 使用独立窗口，避免继承灵动岛的原生窗口层级。
+        super().__init__()
         self.setModal(False)
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self._island = island
         self._autostart_enabled = autostart_enabled
         self._reload_config = reload_config
@@ -128,6 +128,7 @@ class SettingsWindow(QtWidgets.QDialog):
         self._bindings = []
         self._tab_switches = {}
         self._hotkey_buttons = {}
+        self._translation_language_boxes = {}
         self._update_status = None
         self._update_check_button = None
         self._update_install_button = None
@@ -162,6 +163,8 @@ class SettingsWindow(QtWidgets.QDialog):
             if name == "高级":
                 sidebar.addSpacing(13)
                 sidebar.addWidget(QtWidgets.QLabel("管理", objectName="sideCaption"))
+            elif name == "版本与更新":
+                sidebar.addStretch()
             button = QtWidgets.QToolButton(objectName="nav", text=name, checkable=True)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -171,7 +174,6 @@ class SettingsWindow(QtWidgets.QDialog):
             group.addButton(button)
             sidebar.addWidget(button)
             self._buttons[name] = button
-        sidebar.addStretch()
         sidebar.addWidget(QtWidgets.QLabel("Wisland · 桌面灵动岛", objectName="sideCaption"))
 
         self._scroll = QtWidgets.QScrollArea(widgetResizable=True)
@@ -199,6 +201,7 @@ class SettingsWindow(QtWidgets.QDialog):
         QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Find, self, activated=self._search.setFocus)
         island.mode_changed.connect(self.refresh)
         island.passthrough_changed.connect(self.refresh)
+        cfg.changed.connect(self._refresh_translation_languages)
         hints = QtGui.QGuiApplication.styleHints()
         hints.colorSchemeChanged.connect(self._apply_style)
         self._apply_style(hints.colorScheme())
@@ -270,6 +273,11 @@ class SettingsWindow(QtWidgets.QDialog):
         card.add_row(title, description, combo, " ".join(label for _, label in choices))
         self._bindings.append((combo, getter, lambda value: combo.setCurrentIndex(max(0, combo.findData(value)))))
         combo.activated.connect(lambda index: self._apply(setter, combo.itemData(index)))
+        return combo
+
+    def _refresh_translation_languages(self):
+        for key, combo in self._translation_language_boxes.items():
+            combo.setCurrentIndex(max(0, combo.findData(cfg.get(key))))
 
     def _action(self, card, title, description, label, callback):
         button = QtWidgets.QPushButton(label)
@@ -277,6 +285,33 @@ class SettingsWindow(QtWidgets.QDialog):
         button.clicked.connect(lambda: self._apply(callback))
         card.add_row(title, description, button)
         return button
+
+    def _config_text(self, card, title, description, key, placeholder="", *, secret=False, keywords=""):
+        field = QtWidgets.QLineEdit(placeholderText=placeholder)
+        field.setAccessibleName(title)
+        field.setMinimumWidth(100)
+        field.setMaximumWidth(250)
+        if secret:
+            field.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self._bindings.append((field, lambda: str(cfg.get(key) or ""), field.setText))
+
+        control = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(control)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(field)
+        button = QtWidgets.QPushButton("保存")
+        button.setAccessibleName(f"保存{title}")
+        layout.addWidget(button)
+        card.add_row(title, description, control, keywords)
+
+        def save():
+            value = field.text().strip()
+            cfg.set(key, value)
+            field.setText(value)
+
+        button.clicked.connect(lambda: self._apply(save, refresh=False))
+        field.returnPressed.connect(lambda: self._apply(save, refresh=False))
 
     def _build_cards(self, set_autostart):
         island = self._island
@@ -292,6 +327,8 @@ class SettingsWindow(QtWidgets.QDialog):
         appearance = self._card("外观", "灵动岛")
         self._choice(appearance, "主题", "为灵动岛选择配色，或根据背后画面的亮度自动切换。",
                      THEME_NAMES, lambda: cfg.get("island.theme"), self._set_theme)
+        self._toggle(appearance, "自动轮换收起视图", "默认每 30 秒在时间天气和小形象之间切换。",
+                     island.auto_cycle_enabled, island.set_auto_cycle_enabled)
         self._toggle(appearance, "参与截图", "允许在系统截图和录屏中显示灵动岛。",
                      island.capture_visible, island.set_capture_visible)
         self._choice(appearance, "远程模式", "被远程控制时暂停毛玻璃实时刷新，避免灵动岛在远端画面里闪烁；期间玻璃保持最后一张背景。",
@@ -358,22 +395,41 @@ class SettingsWindow(QtWidgets.QDialog):
         self._refresh_update_status()
 
         weather = self._card("高级", "天气服务")
-        key_input = QtWidgets.QLineEdit()
-        key_input.setPlaceholderText("留空使用免费额度")
-        key_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
-        key_input.setFixedSize(250, 30)
-        self._bindings.append((key_input, lambda: cfg.get("weather.uapi_key") or "", key_input.setText))
-        key_row = QtWidgets.QWidget()
-        key_layout = QtWidgets.QHBoxLayout(key_row)
-        key_layout.setContentsMargins(0, 0, 0, 0)
-        key_layout.setSpacing(6)
-        key_layout.addWidget(key_input)
-        key_save = QtWidgets.QPushButton("保存")
-        key_save.setFixedSize(64, 30)
-        key_layout.addWidget(key_save)
-        weather.add_row("UAPIs API Key", "可选；留空使用免费额度。Key 保存在本机 config.json。今日已有天气缓存时不会重复请求。",
-                        key_row, "UAPIs 天气 API Key 天气密钥")
-        key_save.clicked.connect(lambda: self._apply(self._save_weather_api_key, key_input.text()))
+        self._config_text(weather, "UAPIs API Key",
+                          "可选。Key 保存在本机 config.json。今日已有天气缓存时不会重复请求。",
+                          "weather.uapi_key", "留空使用免费额度", secret=True, keywords="天气密钥")
+
+        translate = self._card("高级", "翻译")
+        for key, title, description, languages in (
+            ("translate.source_language", "原文语言", "文字翻译时识别或指定输入语言。", SOURCE_LANGUAGES),
+            ("translate.target_language", "译文语言", "文字翻译和剪贴板翻译的输出语言。", TARGET_LANGUAGES),
+        ):
+            self._translation_language_boxes[key] = self._choice(
+                translate, title, description, languages.items(), lambda key=key: cfg.get(key),
+                lambda value, key=key: save_translation_language(cfg, key, value))
+        self._config_text(translate, "翻译 API Key", "文字翻译与实时字幕共用的密钥，保存在本机 config.json。",
+                          "translate.api_key", secret=True, keywords="DeepSeek 翻译密钥")
+        self._config_text(translate, "翻译服务地址", "填写兼容 OpenAI 的 API 基础地址。",
+                          "translate.base_url", "https://api.deepseek.com")
+        self._config_text(translate, "翻译模型", "填写服务提供方支持的模型名称。",
+                          "translate.model", "deepseek-flash")
+        self._config_text(translate, "译声配置路径", "未填写翻译 API Key 时，从指定的译声配置文件读取密钥。",
+                          "translate.import_from", "译声 config.json 的路径")
+
+        live = self._card("高级", "实时字幕")
+        self._choice(live, "音频来源", "下次开始聆听时生效。",
+                     [("loopback", "系统声音"), ("mic", "麦克风")],
+                     lambda: cfg.get("live.audio.source"), lambda value: cfg.set("live.audio.source", value))
+        self._config_text(live, "音频设备", "填写对应来源的设备名称或 ID。下次开始聆听时生效。",
+                          "live.audio.device", "留空使用默认设备")
+        self._config_text(live, "识别模型目录", "相对路径以 Wisland 程序目录为准。重启后生效。",
+                          "live.models_dir", "models")
+        self._toggle(live, "日语识别草稿", "识别过程中先显示日语草稿。下次开始聆听时生效。",
+                     lambda: bool(cfg.get("live.asr.partial")), lambda on: cfg.set("live.asr.partial", on))
+        self._toggle(live, "中文字幕", "将识别出的日语字幕翻译成中文，需要翻译 API Key。",
+                     lambda: bool(cfg.get("live.translate.enabled")), lambda on: cfg.set("live.translate.enabled", on))
+        self._toggle(live, "实时翻译草稿", "开启中文字幕后，可在整句识别完成前显示中文草稿。",
+                     lambda: bool(cfg.get("live.translate.live")), lambda on: cfg.set("live.translate.live", on))
 
         files = self._card("高级", "配置文件")
         self._action(files, "编辑配置", "在默认编辑器中打开 config.json。", "打开文件",
@@ -463,7 +519,7 @@ class SettingsWindow(QtWidgets.QDialog):
         self._empty.setVisible(not matched)
         self._scroll.verticalScrollBar().setValue(0)
 
-    def _apply(self, setter, *args):
+    def _apply(self, setter, *args, refresh=True):
         try:
             setter(*args)
         except ValueError as exc:
@@ -471,7 +527,8 @@ class SettingsWindow(QtWidgets.QDialog):
         except OSError:
             QtWidgets.QMessageBox.warning(self, "操作失败", "无法完成操作，请检查文件或系统权限后重试。")
         finally:
-            self.refresh()
+            if refresh:
+                self.refresh()
 
     def _set_theme(self, mode):
         cfg.set("island.theme", mode)
@@ -490,10 +547,6 @@ class SettingsWindow(QtWidgets.QDialog):
         if self._island.passthrough():
             self._island.set_passthrough(False)
         self._island.set_expand_mode(mode)
-
-    @staticmethod
-    def _save_weather_api_key(value):
-        cfg.set("weather.uapi_key", str(value or "").strip())
 
     def _set_tab_visible(self, key, on):
         selected = set(self._island.nav.keys())

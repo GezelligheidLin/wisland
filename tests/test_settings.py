@@ -1,4 +1,5 @@
 """设置窗口的交互回归测试，不修改用户配置、注册表或系统热键。"""
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,13 +13,20 @@ from wisland.ui.island import Island, parse_hotkey
 from wisland.ui.settings import SettingsWindow
 
 
-class SettingsIsland(QtCore.QObject):
+class SettingsIsland(QtWidgets.QWidget):
     mode_changed = QtCore.Signal(str)
     passthrough_changed = QtCore.Signal(bool)
+    auto_cycle_enabled = Island.auto_cycle_enabled
+    _auto_cycle_interval = Island._auto_cycle_interval
+    set_auto_cycle_enabled = Island.set_auto_cycle_enabled
+    apply_auto_cycle = Island.apply_auto_cycle
 
     def __init__(self, config):
         super().__init__()
+        self.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint)
         self.config = config
+        self._auto_cycle_timer = QtCore.QTimer(self)
+        self.apply_auto_cycle()
         self.pages = [SimpleNamespace(key="home", title="主页"), SimpleNamespace(key="msg", title="消息")]
         self.nav = SimpleNamespace(keys=lambda: self.visible_tabs)
         self.apply_visible_tabs()
@@ -99,7 +107,9 @@ class SettingsWindowTests(_ConfigTests):
     def setUp(self):
         super().setUp()
         self.start_patch("wisland.ui.settings.cfg", self.config)
+        self.start_patch("wisland.ui.island.cfg", self.config)
         self.island = SettingsIsland(self.config)
+        self.addCleanup(self.island.deleteLater)
         self.set_startup = Mock()
         self.reload = Mock(side_effect=self.config.load)
         self.window = SettingsWindow(self.island, lambda: bool(self.set_startup.call_args),
@@ -146,6 +156,38 @@ class SettingsWindowTests(_ConfigTests):
         self.assertEqual(combo.currentData(), "sky")
         self.assertEqual(Config().get("island.theme"), "sky")
 
+    def test_auto_cycle_switch_controls_timer_and_preserves_interval(self):
+        self.click(self.window._buttons["外观"])
+        switch = self.control(QtWidgets.QCheckBox, "自动轮换收起视图")
+        timer = self.island._auto_cycle_timer
+        self.assertTrue(switch.isChecked())
+        self.assertTrue(timer.isActive())
+        self.assertEqual(timer.interval(), 30000)
+        self.config.set("island.auto_cycle_s", 45)
+        self.click(switch)
+        self.assertFalse(timer.isActive())
+        self.assertFalse(Config().get("island.auto_cycle_enabled"))
+        self.click(switch)
+        self.assertTrue(timer.isActive())
+        self.assertEqual(timer.interval(), 45000)
+        self.assertTrue(Config().get("island.auto_cycle_enabled"))
+
+    def test_legacy_zero_interval_stays_off_until_enabled(self):
+        self.config.set("island.auto_cycle_s", 0)
+        self.island.apply_auto_cycle()
+        self.window.refresh()
+        self.click(self.window._buttons["外观"])
+        switch = self.control(QtWidgets.QCheckBox, "自动轮换收起视图")
+        self.assertFalse(switch.isChecked())
+        self.assertFalse(self.island._auto_cycle_timer.isActive())
+        self.click(switch)
+        self.assertEqual(Config().get("island.auto_cycle_s"), 30)
+        self.assertTrue(self.island._auto_cycle_timer.isActive())
+
+    def test_window_is_independent_of_topmost_island(self):
+        self.assertIsNone(self.window.parentWidget())
+        self.assertFalse(self.window.windowFlags() & QtCore.Qt.WindowType.WindowStaysOnTopHint)
+
     def test_remote_mode_dropdown_applies_and_saves_choice(self):
         self.click(self.window._buttons["外观"])
         combo = self.control(QtWidgets.QComboBox, "远程模式")
@@ -179,6 +221,69 @@ class SettingsWindowTests(_ConfigTests):
         self.click(self.control(QtWidgets.QPushButton, "重新加载配置"))
         self.reload.assert_called_once_with()
 
+    def test_settings_save_uapis_key_to_dedicated_config_field(self):
+        self.click(self.window._buttons["高级"])
+        key = self.control(QtWidgets.QLineEdit, "UAPIs API Key")
+        self.assertEqual(key.echoMode(), QtWidgets.QLineEdit.EchoMode.Password)
+        key.setText("  uapi-test-key  ")
+        self.click(self.control(QtWidgets.QPushButton, "保存UAPIs API Key"))
+        self.assertEqual(Config().get("weather.uapi_key"), "uapi-test-key")
+
+    def test_advanced_translation_settings_mask_and_save_fields(self):
+        self.click(self.window._buttons["高级"])
+        key = self.control(QtWidgets.QLineEdit, "翻译 API Key")
+        model = self.control(QtWidgets.QLineEdit, "翻译模型")
+        self.assertTrue(key.isVisible())
+        self.assertEqual(key.echoMode(), QtWidgets.QLineEdit.EchoMode.Password)
+        key.setText(" example-key ")
+        model.setText("example-model")
+        self.click(self.control(QtWidgets.QPushButton, "保存翻译 API Key"))
+        self.click(self.control(QtWidgets.QPushButton, "保存翻译模型"))
+        saved = Config()
+        self.assertEqual(saved.get("translate.api_key"), "example-key")
+        self.assertEqual(saved.get("translate.model"), "example-model")
+
+    def test_translation_page_and_settings_share_language_selections(self):
+        from wisland.ui.pages.tools import TranslatePage
+
+        self.start_patch("wisland.ui.pages.tools.cfg", self.config)
+        live = Mock()
+        live.available.return_value = (True, "")
+        page = TranslatePage(SimpleNamespace(live=live, learn=Mock(), translate=Mock(), actions=Mock()))
+        self.addCleanup(page.deleteLater)
+        self.addCleanup(page.popup.deleteLater)
+        self.click(self.window._buttons["高级"])
+        source = self.control(QtWidgets.QComboBox, "原文语言")
+        target = self.control(QtWidgets.QComboBox, "译文语言")
+        source_button = page._language_buttons["translate.source_language"][0]
+        target_button = page._language_buttons["translate.target_language"][0]
+        self.assertEqual(source.currentData(), "auto")
+        self.assertEqual(target.currentData(), "zh-Hans")
+        with patch.object(QtWidgets.QMenu, "popup"):
+            source_button.clicked.emit()
+        menu = source_button.findChild(QtWidgets.QMenu)
+        next(action for action in menu.actions() if action.text().strip() == "韩语").trigger()
+        self.assertEqual(source.currentData(), "ko")
+        self.assertIn("韩语", source_button.text)
+        target.activated.emit(target.findData("en"))
+        self.assertIn("英语", target_button.text)
+        saved = Config()
+        self.assertEqual(saved.get("translate.source_language"), "ko")
+        self.assertEqual(saved.get("translate.target_language"), "en")
+
+    def test_advanced_live_subtitle_settings_are_searchable_and_saved(self):
+        self.window._search.setText("实时字幕 音频来源")
+        source = self.control(QtWidgets.QComboBox, "音频来源")
+        self.assertTrue(source.isVisible())
+        source.activated.emit(source.findData("mic"))
+        self.assertEqual(Config().get("live.audio.source"), "mic")
+
+        self.window._search.setText("实时字幕 中文字幕")
+        subtitles = self.control(QtWidgets.QCheckBox, "中文字幕")
+        self.assertTrue(subtitles.isChecked())
+        self.click(subtitles)
+        self.assertFalse(Config().get("live.translate.enabled"))
+
     def test_passthrough_shows_as_expand_mode_and_turns_off_with_others(self):
         combo = self.control(QtWidgets.QComboBox, "展开方式")
         self.config.set("island.expand_mode", "click")
@@ -209,6 +314,9 @@ class SettingsWindowTests(_ConfigTests):
         version = control(QtWidgets.QLabel, "当前安装版本号")
         status = control(QtWidgets.QLabel, "更新检查状态")
         self.assertEqual(version.text(), "v1.2.3")
+        self.assertTrue(version.isVisible())
+        self.assertEqual(window._title.text(), "版本与更新")
+        self.assertEqual({card.category for card in window._cards if card.isVisible()}, {"版本与更新"})
         self.assertEqual(status.text(), "尚未检查")
         QtTest.QTest.mouseClick(control(QtWidgets.QPushButton, "立即检查更新"),
                                 QtCore.Qt.MouseButton.LeftButton)
@@ -233,6 +341,50 @@ class SettingsWindowTests(_ConfigTests):
         updates.changed.emit()
         self.assertEqual(status.text(), "正在下载更新 42%")
         self.assertFalse(control(QtWidgets.QPushButton, "立即检查更新").isEnabled())
+
+
+class TranslationSettingsTests(_ConfigTests):
+    def test_translation_request_uses_selected_languages(self):
+        import httpx
+
+        from wisland.services.translate import TranslateService
+
+        self.start_patch("wisland.services.translate.cfg", self.config)
+        service = TranslateService()
+        self.config.set("translate.api_key", "example-key")
+        self.config.set("translate.source_language", "en")
+        self.config.set("translate.target_language", "fr")
+        requests = []
+
+        def reply(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"Bonjour"}}]}\n\ndata: [DONE]\n')
+
+        done = Mock()
+        service.finished.connect(done)
+        service._current = 1
+        with httpx.Client(transport=httpx.MockTransport(reply)) as client, \
+                patch.object(service, "_http", return_value=client), patch("wisland.services.translate.ui"):
+            service._work(1, "Hello")
+        self.assertIn("原文语言为英语", requests[0]["messages"][0]["content"])
+        self.assertIn("翻译成法语", requests[0]["messages"][0]["content"])
+        self.assertEqual(requests[0]["messages"][1]["content"], "Hello")
+        done.assert_called_once_with(1, "Bonjour")
+
+    def test_changing_import_path_refreshes_translation_credentials(self):
+        from wisland.services.translate import TranslateService
+
+        self.start_patch("wisland.services.translate.cfg", self.config)
+        from wisland.core import config
+
+        service = TranslateService()
+        for label in ("first", "second"):
+            source = config.CONFIG_PATH.with_name(f"{label}.json")
+            source.write_text(json.dumps({"translate": {"api_key": f"example-{label}"}}), encoding="utf-8")
+            self.config.set("translate.import_from", str(source))
+            self.assertEqual(service._settings()[0], f"example-{label}")
+        self.config.set("translate.import_from", "")
+        self.assertFalse(service.has_key())
 
 
 class HotkeySettingsTests(_ConfigTests):

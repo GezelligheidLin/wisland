@@ -10,7 +10,6 @@ from unittest.mock import Mock, patch
 from PySide6 import QtCore, QtWidgets
 
 from wisland.services import weather
-from wisland.ui.settings import SettingsWindow
 
 
 class WeatherTests(unittest.TestCase):
@@ -69,11 +68,6 @@ class WeatherTests(unittest.TestCase):
         glyph, family = weather.weather_glyph("101")
         self.assertEqual(family, "qweather-icons")
         self.assertEqual(glyph, "\uf102")
-
-    def test_settings_save_uapis_key_to_dedicated_config_field(self):
-        with patch.object(weather.cfg, "set") as save:
-            SettingsWindow._save_weather_api_key("  uapi-test-key  ")
-        save.assert_called_once_with("weather.uapi_key", "uapi-test-key")
 
     def test_explicit_utc_forecast_keeps_zero_timezone_offset(self):
         epoch, offset, has_offset = weather._epoch_and_offset("2026-11-20T12:00:00Z")

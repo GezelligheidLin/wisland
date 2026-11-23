@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""日译中：DeepSeek（OpenAI 兼容）流式接口。参考 译声 jpsub/core/translate.py。
+"""文字翻译：OpenAI 兼容流式接口。参考 译声 jpsub/core/translate.py。
 
 信号
   delta(int, str)     (请求 id, 新增片段)
@@ -26,17 +26,51 @@ HISTORY_MAX = 30
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 TOTAL_DEADLINE_S = 60.0
 
-SYSTEM_PROMPT = (
-    "你是专业的日译中翻译。把用户给出的文本翻译成简体中文。\n"
-    "要求：\n"
-    "1. 只输出译文，不加解释、原文、引号或任何前后缀。\n"
-    "2. 译文自然、简洁，符合中文表达习惯；保留原文的语气、情绪、敬语层次、时态、否定和疑问。\n"
-    "3. 保留原文的段落与换行结构；专有名词、作品名、人名使用中文圈通行译法，没有通行译法时音译或保留原文。\n"
-    "4. 网络用语与俚语按语境意译（如 草→笑死，エモい→戳心，推し→本命，やばい 按褒贬译为「绝了/不妙」）。\n"
-    "5. 原文省略主语时不擅自补出；句子没说完时保留未完成的语气。\n"
-    "6. 如果输入不是日语，也照样翻译成简体中文。\n"
-    "7. 如果输入只是一个日语单词或短词组：第一行给出中文释义；第二行写「读音：假名」并附一句简短的补充释义（词性或用法）。"
-)
+TARGET_LANGUAGES = {
+    "zh-Hans": "简体中文",
+    "zh-Hant": "繁体中文",
+    "en": "英语",
+    "ja": "日语",
+    "ko": "韩语",
+    "fr": "法语",
+    "de": "德语",
+    "es": "西班牙语",
+    "pt": "葡萄牙语",
+    "it": "意大利语",
+    "ru": "俄语",
+    "ar": "阿拉伯语",
+    "th": "泰语",
+    "vi": "越南语",
+    "id": "印度尼西亚语",
+}
+SOURCE_LANGUAGES = {"auto": "自动识别", **TARGET_LANGUAGES}
+
+
+def save_translation_language(config, key: str, language: str):
+    """保存文字翻译的语言选择，并同步所有打开的界面。"""
+    previous = config.get(key)
+    try:
+        config.set(key, language)
+    except OSError:
+        config.set(key, previous, save=False)
+        raise
+    config.changed.emit()
+
+
+def _system_prompt(source: str, target: str) -> str:
+    source_name = TARGET_LANGUAGES.get(source)
+    target_name = TARGET_LANGUAGES.get(target, "简体中文")
+    source_instruction = f"原文语言为{source_name}。" if source_name else "自动识别原文语言。"
+    prompt = (
+        f"你是专业的翻译。{source_instruction}把用户提供的文本翻译成{target_name}。\n"
+        "通常只输出译文，不加解释、原文、引号或任何前后缀。\n"
+        "用自然的目标语言表达，保留原文的段落、换行、语气、敬语层次和未完成的句子。\n"
+        "专有名词使用目标语言的通行译法，俚语按语境意译，不擅自补出省略的主语。"
+    )
+    if source_name in (None, "日语") and target_name == "简体中文":
+        prompt += ("\n如果原文只是一个日语单词或短词组，第一行给出中文释义，"
+                   "第二行写「读音：假名」并附简短的词性或用法。")
+    return prompt
 
 
 class _Cancelled(Exception):
@@ -70,7 +104,7 @@ class TranslateService(QtCore.QObject):
         self._client_lock = threading.Lock()
         self._seq = 0
         self._current = 0
-        self._imported: dict | None = None
+        self._imported: tuple[str, dict] | None = None
         self.history: list[dict] = self._load_history()
 
     def start(self):
@@ -100,10 +134,11 @@ class TranslateService(QtCore.QObject):
 
     def _import_settings(self) -> dict:
         """从 译声 的 config.json 读取 translate.*（仅内存，不写回我们的配置）。"""
-        if self._imported is not None:
-            return self._imported
-        out: dict = {}
         path = expand(cfg.get("translate.import_from") or "")
+        cached = self._imported
+        if cached is not None and cached[0] == path:
+            return cached[1]
+        out: dict = {}
         if path and os.path.exists(path):
             try:
                 with open(path, encoding="utf-8") as f:
@@ -113,8 +148,8 @@ class TranslateService(QtCore.QObject):
                        "model": str(t.get("model") or "").strip()}
             except Exception:  # noqa: BLE001
                 out = {}
-        if out.get("api_key"):
-            self._imported = out  # 找到 key 才缓存；没找到时下次再读（用户可能稍后配置）
+        # 找到 key 才缓存；换文件时重新读取。
+        self._imported = (path, out) if out.get("api_key") else None
         return out
 
     def has_key(self) -> bool:
@@ -152,10 +187,12 @@ class TranslateService(QtCore.QObject):
         try:
             key, base, model = self._settings()
             if not key:
-                raise RuntimeError("未设置 DeepSeek API Key（config.json → translate.api_key）")
+                raise RuntimeError("未设置翻译 API Key（设置 → 管理 → 高级 → 翻译）")
+            source = str(cfg.get("translate.source_language"))
+            target = str(cfg.get("translate.target_language"))
             payload = {
                 "model": model,
-                "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                "messages": [{"role": "system", "content": _system_prompt(source, target)},
                              {"role": "user", "content": text}],
                 "temperature": 1.0,
                 "thinking": {"type": "disabled"},

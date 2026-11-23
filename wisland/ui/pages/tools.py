@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""剪贴板历史与日语翻译。"""
+"""剪贴板历史、文字翻译与实时字幕。"""
 from __future__ import annotations
 
 import time
@@ -7,6 +7,7 @@ import time
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ...core.config import cfg
+from ...services.translate import SOURCE_LANGUAGES, TARGET_LANGUAGES, save_translation_language
 from ..anim import clamp
 from ..theme import G, W, icon_font, theme, ui_font
 from ..widgets import (Segmented, Card, Hoverable, IconButton, Label, LineEdit, PillButton, ScrollArea, TextEdit, hbox, painter,
@@ -620,7 +621,7 @@ class TranslatePage(Page):
     def __init__(self, ctx):
         super().__init__(ctx)
         self.req = -1
-        self.input = TextEdit("日语")
+        self.input = TextEdit("输入要翻译的文字")
         self.input.setFixedHeight(86)
         self.input.focus_wanted.connect(self.want_focus)
         self.input.submit.connect(self.go)
@@ -644,8 +645,20 @@ class TranslatePage(Page):
         self.state = Label("", 11, level=3)
         self.out_card.setLayout(vbox(hbox(self.state, None, self.copy),
                                      (sc, 1), spacing=2, margins=(14, 6, 8, 10)))
+        self._language_buttons = {}
+        for key, title, choices in (
+            ("translate.source_language", "原文语言", SOURCE_LANGUAGES),
+            ("translate.target_language", "译文语言", TARGET_LANGUAGES),
+        ):
+            button = PillButton("", height=30)
+            button.setAccessibleName(title)
+            button.clicked.connect(lambda key=key: self._show_language_menu(key))
+            self._language_buttons[key] = button, title, choices
+        cfg.changed.connect(self._refresh_language_buttons)
+        self._refresh_language_buttons()
         text_w = QtWidgets.QWidget()
-        text_w.setLayout(vbox(self.input, hbox(go, clipb, None, spacing=6), (self.out_card, 1), spacing=8))
+        text_w.setLayout(vbox(hbox(*(button for button, _, _ in self._language_buttons.values()), None),
+                              self.input, hbox(go, clipb, None, spacing=6), (self.out_card, 1), spacing=8))
 
         # 实时字幕（移植自译声：系统声音 → 日语识别 → 翻译）
         self.live_btn = PillButton("开始聆听", G.LIVE, height=30, primary=True)
@@ -701,6 +714,33 @@ class TranslatePage(Page):
         self.clear_btn.hide()
         self.input.textChanged.connect(self._sync_clear)
         self.input.installEventFilter(self)
+
+    def _refresh_language_buttons(self):
+        for key, (button, title, choices) in self._language_buttons.items():
+            name = choices.get(str(cfg.get(key)), next(iter(choices.values())))
+            button.set_text(f"{title} · {name} ▾")
+
+    def _show_language_menu(self, key: str):
+        from .system import styled_menu
+
+        button, _, choices = self._language_buttons[key]
+        menu = styled_menu(button)
+        current = cfg.get(key, next(iter(choices)))
+        for code, label in choices.items():
+            action = menu.addAction(f"✓  {label}" if code == current else f"    {label}")
+            action.triggered.connect(lambda _checked=False, code=code: self._set_language(key, code))
+        island = self.island
+        if island:
+            island.locks.add("menu")
+            menu.aboutToHide.connect(lambda: island.locks.discard("menu"))
+        menu.aboutToHide.connect(menu.deleteLater)
+        menu.popup(button.mapToGlobal(button.rect().bottomLeft()))
+
+    def _set_language(self, key: str, code: str):
+        try:
+            save_translation_language(cfg, key, code)
+        except OSError:
+            self.state.setText("无法保存语言设置")
 
     def lookup(self, word: str, ctx: dict):
         if not word:
