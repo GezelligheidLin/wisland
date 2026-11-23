@@ -21,7 +21,7 @@ from ctypes import wintypes
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ..core.config import cfg
+from ..core.config import DEFAULTS, cfg
 from ..services.remote import RemoteWatch
 from .anim import Spring, clamp, lerp, smooth
 from .compact import CompactView
@@ -325,6 +325,7 @@ class Island(QtWidgets.QWidget):
         self.poll = QtCore.QTimer(self, interval=25, timeout=self._poll_hover)
         self.lp_timer = QtCore.QTimer(self, singleShot=True, interval=420, timeout=self._long_press)
         self._click_timer = QtCore.QTimer(self, singleShot=True, timeout=self._single_click)
+        self._auto_cycle_timer = QtCore.QTimer(self, timeout=self._cycle_compact_display)
         self._dbl_filter = _BlankDoubleClick(self)
         QtWidgets.QApplication.instance().installEventFilter(self._dbl_filter)
         self.backdrop.ready.connect(self._on_backdrop)
@@ -332,6 +333,7 @@ class Island(QtWidgets.QWidget):
 
         self._place_initial()
         self.apply_visible_tabs()
+        self.apply_auto_cycle()
 
     # ================================================================ 屏幕 / 位置
     def _pick_screen(self) -> QtGui.QScreen:
@@ -1049,7 +1051,8 @@ class Island(QtWidgets.QWidget):
                 # 让截图 / 录屏几乎总能拍到灵动岛（动画、拖动时仍高频刷新）
                 interval = 1 / (min(fps, 8.0) if theme.mode == "auto" else (1.5 if self.expanded else 1.0))
         need = self.path.boundingRect().toAlignedRect().translated(self._win_origin).intersected(self.scr.geometry())
-        self.backdrop.request(self.scr, g, interval, urgent=not self.backdrop.covers(need))
+        sample = self.body.toAlignedRect().translated(self._win_origin)
+        self.backdrop.request(self.scr, g, interval, urgent=not self.backdrop.covers(need), sample_rect=sample)
 
     def _on_remote_changed(self, active: bool):
         """远程模式开关：暂停 / 恢复毛玻璃取背景，远端画面不再因临时排除自己而闪烁。"""
@@ -1070,7 +1073,7 @@ class Island(QtWidgets.QWidget):
         """新截图从当前混合画面接续；同一主题内的连续采样不延后动画终点。"""
         previous_palette = theme.pal_name
         theme.feed_luminance(self.backdrop.luminance)
-        if not changed:
+        if not changed and previous_palette == theme.pal_name:
             return
         now = time.perf_counter()
         continuing = False
@@ -1436,6 +1439,31 @@ class Island(QtWidgets.QWidget):
 
     def apply_remote_mode(self):
         self.remote.apply_mode()
+
+    def auto_cycle_enabled(self) -> bool:
+        return bool(cfg.get("island.auto_cycle_enabled")) and self._auto_cycle_interval() > 0
+
+    def _auto_cycle_interval(self) -> int:
+        return int(cfg.get("island.auto_cycle_s") or 0) * 1000
+
+    def set_auto_cycle_enabled(self, on: bool):
+        if on and self._auto_cycle_interval() <= 0:
+            # 旧配置以 0 表示关闭，重新开启时恢复默认间隔。
+            cfg.set("island.auto_cycle_s", DEFAULTS["island"]["auto_cycle_s"], save=False)
+        cfg.set("island.auto_cycle_enabled", on)
+        self.apply_auto_cycle()
+
+    def apply_auto_cycle(self):
+        if self.auto_cycle_enabled():
+            self._auto_cycle_timer.start(self._auto_cycle_interval())
+        else:
+            self._auto_cycle_timer.stop()
+
+    def _cycle_compact_display(self):
+        if self.expanded or self.passthrough() or self.compact.view not in ("clock", "pet"):
+            return
+        self.compact.set_view("pet" if self.compact.view == "clock" else "clock")
+        self._kick()
 
     def capture_visible(self) -> bool:
         return not bool(cfg.get("island.exclude_from_capture", False))

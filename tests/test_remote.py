@@ -155,7 +155,8 @@ class BackdropPauseTests(unittest.TestCase):
         calls = []
         backdrop._capture = lambda *args: calls.append(time.monotonic())
         screen = QtWidgets.QApplication.primaryScreen()
-        backdrop.request(screen, QtCore.QRect(0, 0, 240, 120), 0.02)
+        rect = QtCore.QRect(0, 0, 240, 120)
+        backdrop.request(screen, rect, 0.02, sample_rect=rect)
         backdrop.start()
         self.addCleanup(backdrop.stop)
         try:

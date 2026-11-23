@@ -102,6 +102,36 @@ class BackgroundTransitionTests(unittest.TestCase):
                 final = panel.pixel(11.340001)
                 self.assertEqual(final, panel.pixel(12))
 
+    def test_auto_theme_samples_current_body_inside_wider_background(self):
+        screen_rect = QtCore.QRect(-1920, 0, 1920, 1080)
+        screen = SimpleNamespace(geometry=lambda: screen_rect, devicePixelRatio=lambda: 1.5)
+        capture = QtCore.QRect(-1760, -40, 400, 280)
+        bright_body = QtCore.QRect(-1640, 0, 160, 24)
+        dark_body = bright_body.translated(0, 24)
+        desktop = QtGui.QImage(100, 60, QtGui.QImage.Format.Format_RGB32)
+        desktop.fill(QtCore.Qt.GlobalColor.black)
+        painter = QtGui.QPainter(desktop)
+        painter.fillRect(30, 0, 40, 6, QtCore.Qt.GlobalColor.white)
+        painter.end()
+        backdrop = Backdrop()
+        panel = Panel(160, 24)
+        panel.backdrop = backdrop
+        backdrop.ready.connect(panel._on_backdrop)
+        theme.set_mode("auto")
+
+        with patch("wisland.ui.glass.grab_tiny", return_value=desktop) as grab:
+            backdrop.request(screen, capture, .1, sample_rect=bright_body)
+            backdrop._capture(*backdrop._want)
+            grab.assert_called_once_with(-1680, 0, 600, 360, 100, 60)
+            self.assertEqual(backdrop.rect, capture.intersected(screen_rect))
+            self.assertAlmostEqual(backdrop.luminance, 1)
+            self.assertEqual(theme.pal_name, "light")
+
+            backdrop.request(screen, capture, .1, sample_rect=dark_body)
+            backdrop._capture(*backdrop._want)
+            self.assertAlmostEqual(backdrop.luminance, 0)
+            self.assertEqual(theme.pal_name, "dark")
+
     def test_blend_preserves_global_coordinates_when_capture_moves(self):
         source = QtGui.QImage(20, 10, QtGui.QImage.Format.Format_RGB32)
         source.fill(QtGui.QColor('black'))

@@ -16,6 +16,7 @@
     "expand_mode": "hover",
     "pinned": false,
     "compact_view": "clock",
+    "auto_cycle_enabled": true,
     "auto_cycle_s": 30,
     "passthrough": false
   },
@@ -123,6 +124,8 @@
     "api_key": "",
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-flash",
+    "source_language": "auto",
+    "target_language": "zh-Hans",
     "import_from": ""
   },
   "apps": {

@@ -424,6 +424,7 @@ def main():
     def reload_cfg():
         mode, passthrough, capture = island.expand_mode(), island.passthrough(), island.capture_visible()
         cfg.load()
+        cfg.changed.emit()
         island.apply_visible_tabs()
         if mode != island.expand_mode():
             island.apply_expand_mode()
@@ -432,6 +433,7 @@ def main():
         if capture != island.capture_visible():
             island.apply_capture_mode()
         island.apply_remote_mode()
+        island.apply_auto_cycle()
         theme.set_mode(cfg.get("island.theme", "auto"))
         island.register_hotkeys()
         ctx.weather.refresh()
@@ -525,16 +527,6 @@ def main():
     tray.setContextMenu(tmenu)
     tray.activated.connect(lambda r: island.toggle() if r == QtWidgets.QSystemTrayIcon.ActivationReason.Trigger else None)
     tray.show()
-
-    # ---------------- 收起态：时间天气与小形象每隔几十秒自动轮换 ----------------
-    def auto_cycle():
-        if island.expanded or island.passthrough() or compact.view not in ("clock", "pet"):
-            return
-        compact.set_view("pet" if compact.view == "clock" else "clock")
-        island._kick()
-    cyc = int(cfg.get("island.auto_cycle_s", 30) or 0)
-    if cyc > 0:
-        QtCore.QTimer(app, interval=cyc * 1000, timeout=auto_cycle).start()
 
     # ---------------- 全屏时隐藏 ----------------
     def check_fullscreen():

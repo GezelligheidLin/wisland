@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui
 
 WDA_EXCLUDEFROMCAPTURE = 0x11
 DOWN = 12  # 缩小倍数（越大越糊）
+SAMPLE_DOWN = 4  # 收起时本体较窄，保留更多像素供裁切测光
 
 _u32 = ctypes.WinDLL("user32")
 _gdi = ctypes.WinDLL("gdi32")
@@ -107,7 +108,7 @@ class Backdrop(QtCore.QObject):
         self._capture_rect = QtCore.QRect()
         self._captured.connect(self._publish)
         self._lock = threading.Lock()
-        self._want: tuple | None = None     # (逻辑区域, 物理区域)
+        self._want: tuple | None = None     # (逻辑截图区域, 物理截图区域, 测光区域)
         self._interval = 0.1
         self._wake = threading.Event()
         self._stop = False
@@ -165,8 +166,9 @@ class Backdrop(QtCore.QObject):
         self._stop = True
         self._wake.set()
 
-    def request(self, screen: QtGui.QScreen, grect: QtCore.QRect, interval: float, urgent: bool = False):
-        """grect：需要覆盖的全局逻辑区域；interval：期望的刷新间隔（秒）。"""
+    def request(self, screen: QtGui.QScreen, grect: QtCore.QRect, interval: float,
+                urgent: bool = False, *, sample_rect: QtCore.QRect):
+        """grect 为毛玻璃纹理范围，sample_rect 为本体测光范围，均使用全局逻辑坐标。"""
         sg = screen.geometry()
         r = grect.intersected(sg)
         if r.width() < 4 or r.height() < 4:
@@ -177,7 +179,7 @@ class Backdrop(QtCore.QObject):
         py = sg.y() + round((r.y() - sg.y()) * dpr)
         phys = (px, py, round(r.width() * dpr), round(r.height() * dpr))
         with self._lock:
-            new = (QtCore.QRect(r), phys)
+            new = (r, phys, sample_rect.intersected(r))
             moved = self._want is None or self._want[0] != new[0]
             self._want = new
             self._interval = interval
@@ -214,24 +216,33 @@ class Backdrop(QtCore.QObject):
                 import traceback
                 traceback.print_exc()
 
-    def _capture(self, r: QtCore.QRect, phys):
+    def _capture(self, r: QtCore.QRect, phys, sample_rect: QtCore.QRect):
         tw, th = max(2, r.width() // DOWN), max(2, r.height() // DOWN)
+        sw, sh = r.width() // SAMPLE_DOWN, r.height() // SAMPLE_DOWN
+        sw, sh = max(tw, sw), max(th, sh)
         toggle = self.self_exclude and self.hwnd
         if toggle:
             _u32.SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE)
         try:
-            img = grab_tiny(phys[0], phys[1], phys[2], phys[3], tw, th)
+            img = grab_tiny(*phys, sw, sh)
         finally:
             if toggle:
                 _u32.SetWindowDisplayAffinity(self.hwnd, 0)
         if img is None:
             return
-        img = img.convertToFormat(QtGui.QImage.Format.Format_ARGB32_Premultiplied)
-        img = _blur(_blur(img))
         mode = QtCore.Qt.TransformationMode.SmoothTransformation
-        sig = bytes(img.scaled(8, 4, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio, mode).constBits())
-        c = img.scaled(1, 1, QtCore.Qt.AspectRatioMode.IgnoreAspectRatio, mode).pixelColor(0, 0)
-        lum = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
+        aspect = QtCore.Qt.AspectRatioMode.IgnoreAspectRatio
+        # 在模糊前裁切本体，避免预留的展开区和纹理边距影响明暗判断。
+        scale = QtGui.QTransform.fromScale(sw / r.width(), sh / r.height())
+        crop = scale.mapRect(QtCore.QRectF(sample_rect.translated(-r.topLeft()))).toRect()
+        lum = 0.5  # 没有可测像素时保留当前主题。
+        if not crop.isEmpty():
+            c = img.copy(crop).scaled(1, 1, aspect, mode).pixelColor(0, 0)
+            lum = 0.2126 * c.redF() + 0.7152 * c.greenF() + 0.0722 * c.blueF()
+        img = img.scaled(tw, th, aspect, mode).convertToFormat(QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        img = _blur(_blur(img))
+        thumbnail = img.scaled(8, 4, aspect, mode)
+        sig = bytes(thumbnail.constBits())
         changed = sig != self._sig or r != self._capture_rect
         self._sig = sig
         self._capture_rect = QtCore.QRect(r)
