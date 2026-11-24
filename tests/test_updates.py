@@ -10,16 +10,18 @@ from unittest.mock import Mock, patch
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from scripts.build_update_manifest import build_manifest
 from wisland.core.apply_update import COMPLETED, PAYLOAD, UpdateRolledBack, replace_application
 from wisland.core.release import Package, sign_manifest, verified_packages
-from wisland.services.install_update import _download, _extract_portable
-from wisland.services.updates import InstalledRelease, check_for_update
+from wisland.services.install_update import _download, _extract_portable, prepare_update
+from wisland.services.updates import GITHUB_LATEST, GITHUB_RELEASES, InstalledRelease, Update, check_for_update
 
 
 class SignedUpdateTests(unittest.TestCase):
     def setUp(self):
         key = Ed25519PrivateKey.generate()
         private = base64.b64encode(key.private_bytes_raw()).decode("ascii")
+        self.private = private
         self.public = base64.b64encode(key.public_key().public_bytes_raw()).decode("ascii")
         self.origin = "https://updates.example.test"
         self.package = Package(7, hashlib.sha256(b"example").hexdigest())
@@ -48,6 +50,72 @@ class SignedUpdateTests(unittest.TestCase):
         self.assertIn("zip", update.downloads)
         self.manifest = {"version": "1.2.4"}
         self.assertEqual(self.check().packages, {})
+
+    def check_github_fallback(self, manifest):
+        release_file = f"{GITHUB_RELEASES}/download/v1.2.4/latest.json"
+        redirected = "https://release-assets.githubusercontent.com/test-manifest"
+
+        def respond(request):
+            url = str(request.url)
+            if url == GITHUB_LATEST:
+                return httpx.Response(200, json={"tag_name": "v1.2.4"})
+            if url == release_file:
+                return httpx.Response(302, headers={"Location": redirected})
+            if url == redirected:
+                return httpx.Response(200, json=manifest) if manifest else httpx.Response(404)
+            return httpx.Response(403)
+
+        client_class = httpx.Client
+        with patch("wisland.services.updates.httpx.Client", side_effect=lambda **kwargs: client_class(
+                transport=httpx.MockTransport(respond), **kwargs)):
+            return check_for_update(InstalledRelease("1.2.3", self.origin, self.public))
+
+    def test_oss_failure_uses_verified_github_release_assets(self):
+        update = self.check_github_fallback(self.manifest)
+        self.assertEqual(update.packages["exe"], self.package)
+        self.assertEqual(update.downloads["exe"], f"{GITHUB_RELEASES}/download/v1.2.4/Wisland-1.2.4.exe")
+
+    def test_missing_or_invalid_github_manifest_preserves_manual_link(self):
+        for manifest in (None, {"version": "1.2.4"}, {**self.manifest, "version": "1.2.5"}):
+            with self.subTest(manifest=manifest):
+                update = self.check_github_fallback(manifest)
+                self.assertEqual(update.packages, {})
+                self.assertEqual(update.github_url, f"{GITHUB_RELEASES}/tag/v1.2.4")
+
+    def test_published_manifest_verifies_the_built_artifacts(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            dist = Path(directory)
+            (dist / "wisland-1.2.4.zip").write_bytes(b"example")
+            (dist / "Wisland-1.2.4.exe").write_bytes(b"example")
+            build_manifest("1.2.4", dist, self.private, self.public)
+            manifest = json.loads((dist / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(verified_packages(manifest, self.public), {"exe": self.package, "zip": self.package})
+
+    def test_failed_oss_download_retries_github_with_same_digest(self):
+        update = Update("1.2.4", {"exe": self.origin}, {"exe": self.package}, {"exe": GITHUB_RELEASES})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preview = root / "Wisland.exe"
+            preview.touch()
+            (root / "data").mkdir()
+
+            def download(url, path, package, progress):
+                self.assertEqual(package, self.package)
+                self.assertFalse(path.exists())
+                if url == self.origin:
+                    path.write_bytes(b"partial")
+                    raise httpx.ReadError("connection interrupted")
+                path.write_bytes(b"MZexample")
+
+            with patch("wisland.services.install_update.sys.executable", str(preview)), \
+                    patch("wisland.services.install_update.UPDATER", preview), \
+                    patch("wisland.services.install_update._launch", return_value=Mock(wait=Mock(return_value=0))), \
+                    patch("wisland.services.install_update._download", side_effect=download) as fetch:
+                stage = prepare_update(update, "exe", Mock())
+            self.assertEqual([call.args[0] for call in fetch.call_args_list], [self.origin, GITHUB_RELEASES])
+            self.assertEqual((stage / PAYLOAD / "Wisland.exe").read_bytes(), b"MZexample")
 
     def test_wrong_download_digest_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

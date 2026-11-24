@@ -15,7 +15,7 @@
 
 不需要安装 Python。开机自启：右键灵动岛 → **设置 → 常规 → 开机自启**。
 
-带更新检查的版本会在启动后和常驻期间检查正式发布。打开 **设置 → 版本与更新**，发现可验证签名的新版本时，点击 **立即更新** 即可从 OSS 下载与当前运行方式相符的包。校验和下载完成后，Wisland 会退出、替换程序文件并重启，保留原路径、配置、数据和模型。
+带更新检查的版本会在启动后和常驻期间检查正式发布。打开 **设置 → 版本与更新**，发现可验证签名的新版本时，点击 **立即更新** 即可在软件内下载与当前运行方式相符的包。优先从 OSS 下载，必要时自动改用 GitHub。下载并校验完成后，Wisland 会退出、替换程序文件并重启，保留原路径、配置、数据和模型。
 
 早期版本需手动升级一次。可在设置中使用 OSS 的 ZIP 或 EXE 下载入口，或访问 GitHub 发布页。手动更新前退出 Wisland；目录版用新 ZIP 中的 `Wisland.exe` 和 `_internal` 替换原有程序文件，单文件版用新 EXE 替换原文件。保留原文件名可沿用开机自启路径。
 
@@ -46,9 +46,9 @@
    下载变量只填 HTTPS 根地址。客户端会自动拼接 `wisland/releases/` 下的对象路径。可以先上传一个测试对象到该目录，用不带签名参数的 HTTPS 对象 URL 确认能公开读取。如果返回 `PublicEndpointForbidden`，请给 Bucket 绑定已备案的自定义域名并配置 HTTPS，再将这个域名同时填入下载和上传变量。 [阿里云默认 Endpoint 限制](https://help.aliyun.com/zh/oss/publicendpointforbidden-error-when-upload-object) · [OSS 绑定自定义域名](https://help.aliyun.com/zh/oss/user-guide/access-buckets-via-custom-domain-names)
 4. 将用于上传的 RAM 用户凭据设为 Actions Secrets `OSS_ACCESS_KEY_ID` 和 `OSS_ACCESS_KEY_SECRET`。将权限限制在该 Bucket，授权读取 `wisland/releases/latest.json`、向 `wisland/releases/*` 上传对象，以及失败时终止该前缀下的分片上传。
 5. 应用内更新使用 Ed25519 签名清单。在 Actions Variables 中添加 `WISLAND_UPDATE_PUBLIC_KEY`，在 Actions Secrets 中添加对应的 `WISLAND_UPDATE_PRIVATE_KEY`。两者均使用 32 字节原始密钥的 Base64 编码。发版会将公钥嵌入客户端，换钥时需要为旧客户端保留过渡版本。
-6. 推送 `vX.Y.Z` tag 后，Actions 先发布 GitHub Release，再把同一份 ZIP 和 EXE 上传到 OSS 的 `wisland/releases/vX.Y.Z/`。两个文件上传完成后才会更新 `wisland/releases/latest.json`。首次发版后，从下载域名确认更新清单和两个文件可以访问。镜像上传失败后可重跑失败的任务。
+6. 推送 `vX.Y.Z` tag 后，Actions 在 GitHub Release 发布 ZIP、EXE 和共用的签名清单 `latest.json`，随后将两个包上传到 OSS 的 `wisland/releases/vX.Y.Z/`。包上传完成后才会用同一份清单更新 `wisland/releases/latest.json`。首次发版后，从下载域名确认更新清单和两个包可以访问。镜像上传失败后可重跑失败的任务。
 
-未设置 `WISLAND_OSS_DOWNLOAD_BASE` 时，工作流只发 GitHub Release，客户端从 GitHub 检查更新。下载域名会随发布包打入客户端，域名变更时应保留原入口，便于已发布的客户端继续检查。
+未设置 `WISLAND_OSS_DOWNLOAD_BASE` 时，客户端从 GitHub 检查和下载签名更新。下载域名会随发布包打入客户端，域名变更时应保留原入口，便于已发布的客户端继续检查。
 
 ## 功能
 

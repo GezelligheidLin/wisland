@@ -10,7 +10,8 @@ from urllib.parse import urlsplit
 
 RELEASE_INFO_NAME = "release-info.json"
 _OSS_RELEASE_PREFIX = "wisland/releases"
-MANIFEST_KEY = f"{_OSS_RELEASE_PREFIX}/latest.json"
+MANIFEST_NAME = "latest.json"
+MANIFEST_KEY = f"{_OSS_RELEASE_PREFIX}/{MANIFEST_NAME}"
 _STABLE_VERSION = re.compile(r"v?(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){2}")
 _MAX_PACKAGE_BYTES = 2 * 1024**3
 

@@ -1,4 +1,4 @@
-"""下载、验证并暂存与当前运行方式相符的 OSS 更新包。"""
+"""下载、验证并暂存与当前运行方式相符的更新包。"""
 from __future__ import annotations
 
 import ctypes
@@ -35,7 +35,8 @@ def _download(url: str, path: Path, package: Package, progress):
     digest = hashlib.sha256()
     total = 0
     reported = 0
-    with httpx.stream("GET", url, timeout=30, headers={"Accept-Encoding": "identity"}) as response:
+    with httpx.stream("GET", url, timeout=30, follow_redirects=True,
+                      headers={"Accept-Encoding": "identity"}) as response:
         response.raise_for_status()
         with path.open("xb") as output:
             for block in response.iter_bytes(256 * 1024):
@@ -90,7 +91,16 @@ def prepare_update(update: Update, kind: str, progress) -> Path:
         payload = stage / PAYLOAD
         payload.mkdir()
         download = stage / "package.zip" if kind == "zip" else payload / PORTABLE_EXE
-        _download(update.downloads[kind], download, update.packages[kind], progress)
+        package = update.packages[kind]
+        try:
+            _download(update.downloads[kind], download, package, progress)
+        except (httpx.HTTPError, ValueError):
+            fallback = update.fallback_downloads.get(kind)
+            if not fallback:
+                raise
+            download.unlink(missing_ok=True)
+            progress(0)
+            _download(fallback, download, package, progress)
         progress(100)
         if kind == "zip":
             _extract_portable(download, payload)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from ..core.release import (MANIFEST_KEY, RELEASE_INFO_NAME, Package, download_origin,
+from ..core.release import (MANIFEST_KEY, MANIFEST_NAME, RELEASE_INFO_NAME, Package, download_origin,
                             release_object_keys, verified_packages, version_number)
 
 GITHUB_REPO = "GezelligheidLin/wisland"
@@ -39,6 +39,7 @@ class Update:
     version: str
     downloads: dict[str, str]
     packages: dict[str, Package] = field(default_factory=dict)
+    fallback_downloads: dict[str, str] = field(default_factory=dict)
 
     @property
     def github_url(self) -> str:
@@ -46,7 +47,7 @@ class Update:
 
 
 def check_for_update(installed: InstalledRelease) -> Update | None:
-    """查询最新版本。镜像缺失或请求失败时改查 GitHub，网络错误交给调用方处理。"""
+    """优先使用 OSS 签名清单，必要时从 GitHub Release 验签并提供可安装更新。"""
     def fetch(url: str) -> dict:
         with client.stream("GET", url) as response:
             response.raise_for_status()
@@ -61,25 +62,48 @@ def check_for_update(installed: InstalledRelease) -> Update | None:
         return data
 
     current = version_number(installed.version)
-    packages = {}
-    with httpx.Client(timeout=5, headers={"Accept": "application/json"}) as client:
-        mirror = installed.download_base
-        if mirror:
+    oss_reachable = False
+    manual_oss = None
+    with httpx.Client(timeout=5, headers={"Accept": "application/json"}, follow_redirects=True) as client:
+        if mirror := installed.download_base:
             try:
                 manifest = fetch(f"{mirror}/{MANIFEST_KEY}")
                 latest = version_number(manifest.get("version"))
-                if latest > current and installed.update_public_key:
-                    try:
+                oss_reachable = True
+                if latest > current:
+                    version = ".".join(map(str, latest))
+                    links = {kind: f"{mirror}/{key}" for kind, key in release_object_keys(version).items()}
+                    manual_oss = Update(version, links)
+                    if installed.update_public_key:
                         packages = verified_packages(manifest, installed.update_public_key)
-                    except ValueError:
-                        pass  # 兼容旧清单，仍可手动下载。
+                        return Update(version, links, packages, _github_downloads(version))
             except (httpx.HTTPError, ValueError):
-                mirror = ""
-        if not mirror:
-            latest = version_number(fetch(GITHUB_LATEST).get("tag_name"))
+                pass
 
-    if latest <= current:
-        return None
-    version = ".".join(map(str, latest))
-    links = {kind: f"{mirror}/{key}" for kind, key in release_object_keys(version).items()} if mirror else {}
-    return Update(version, links, packages)
+        try:
+            latest = version_number(fetch(GITHUB_LATEST).get("tag_name"))
+        except (httpx.HTTPError, ValueError):
+            if oss_reachable:
+                return manual_oss
+            raise
+
+        if latest <= current or (manual_oss and latest < version_number(manual_oss.version)):
+            return manual_oss
+        version = ".".join(map(str, latest))
+        if installed.update_public_key:
+            try:
+                manifest = fetch(f"{GITHUB_RELEASES}/download/v{version}/{MANIFEST_NAME}")
+                if version_number(manifest.get("version")) != latest:
+                    raise ValueError("更新清单与 GitHub 发布版本不符")
+                packages = verified_packages(manifest, installed.update_public_key)
+                return Update(version, _github_downloads(version), packages)
+            except (httpx.HTTPError, ValueError):
+                pass
+        if manual_oss and manual_oss.version == version:
+            return manual_oss
+        return Update(version, {})
+
+
+def _github_downloads(version: str) -> dict[str, str]:
+    base = f"{GITHUB_RELEASES}/download/v{version}"
+    return {kind: f"{base}/{key.rsplit('/', 1)[-1]}" for kind, key in release_object_keys(version).items()}
