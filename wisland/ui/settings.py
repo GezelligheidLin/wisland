@@ -1,7 +1,6 @@
 """Wisland 的独立设置窗口；改动复用灵动岛现有的设置入口。"""
 from __future__ import annotations
 
-import ctypes
 import os
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -113,8 +112,8 @@ class SettingsWindow(QtWidgets.QDialog):
 
     def __init__(self, island, autostart_enabled, set_autostart, reload_config,
                  installed_release=None, updates=None):
-        # 使用独立窗口，避免继承灵动岛的原生窗口层级。
-        super().__init__()
+        # 使用普通独立窗口，让 Windows 管理任务栏和前后顺序。
+        super().__init__(None, Qt.WindowType.Window)
         self.setModal(False)
         self._island = island
         self._autostart_enabled = autostart_enabled
@@ -218,22 +217,10 @@ class SettingsWindow(QtWidgets.QDialog):
             screen = self._island.screen().availableGeometry()
             self.resize(min(self.width(), screen.width() - 32), min(self.height(), screen.height() - 60))
             self.move(screen.center() - self.rect().center())
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
-        self.setWindowState(Qt.WindowState.WindowNoState)
-        self.show()
-        if self.windowHandle() is not None:
-            self.windowHandle().setVisible(True)
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self.refresh()
-        self.raise_()
+        self.show()
         self.activateWindow()
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        user32.ShowWindow.argtypes = (ctypes.c_void_p, ctypes.c_int)
-        user32.BringWindowToTop.argtypes = (ctypes.c_void_p,)
-        user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
-        hwnd = ctypes.c_void_p(int(self.winId()))
-        user32.ShowWindow(hwnd, 5)
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
 
     def refresh(self):
         """同步配置及主页快捷操作，不触发新的写入。"""
@@ -391,7 +378,8 @@ class SettingsWindow(QtWidgets.QDialog):
             button.clicked.connect(lambda _checked=False, kind=kind: self._open_update_download(kind))
             download_layout.addWidget(button)
             self._update_download_buttons[kind] = button
-        updates.add_row("获取更新", "立即更新会从 OSS 下载并在重启时应用。", download_row, "下载更新")
+        updates.add_row("获取更新", "优先从 OSS 下载，必要时改用 GitHub。校验通过后自动重启。",
+                        download_row, "下载更新")
         self._refresh_update_status()
 
         weather = self._card("高级", "天气服务")
@@ -496,10 +484,11 @@ class SettingsWindow(QtWidgets.QDialog):
         if self._update_check_button is not None:
             self._update_check_button.setEnabled(self._updates is not None and not self._updates._checking
                                                  and progress is None)
-        self._update_install_button.setVisible(self._updates is not None and self._updates.can_install)
+        can_install = self._updates is not None and self._updates.can_install
+        self._update_install_button.setVisible(can_install)
         urls = {**downloads, "github": github_url}
         for kind, button in self._update_download_buttons.items():
-            button.setVisible(bool(urls.get(kind)))
+            button.setVisible(bool(urls.get(kind)) and (not can_install or self._updates.install_failed))
 
     def _open_update_download(self, kind):
         update = self._updates.latest if self._updates is not None else None

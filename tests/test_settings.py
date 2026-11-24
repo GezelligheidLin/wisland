@@ -1,4 +1,5 @@
 """设置窗口的交互回归测试，不修改用户配置、注册表或系统热键。"""
+import ctypes
 import json
 import tempfile
 import unittest
@@ -186,7 +187,33 @@ class SettingsWindowTests(_ConfigTests):
 
     def test_window_is_independent_of_topmost_island(self):
         self.assertIsNone(self.window.parentWidget())
+        self.assertEqual(self.window.windowType(), QtCore.Qt.WindowType.Window)
         self.assertFalse(self.window.windowFlags() & QtCore.Qt.WindowType.WindowStaysOnTopHint)
+
+    def test_normal_window_can_cover_settings_on_windows(self):
+        if self.app.platformName() != "windows":
+            self.skipTest("需要 Windows 原生窗口")
+
+        user32 = ctypes.WinDLL("user32")
+        user32.GetWindow.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+        user32.GetWindow.restype = ctypes.c_void_p
+        user32.GetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int)
+        settings = int(self.window.winId())
+        self.assertFalse(user32.GetWindowLongW(settings, -20) & 0x00000008)  # WS_EX_TOPMOST
+        self.assertFalse(user32.GetWindow(settings, 4))  # GW_OWNER
+
+        other = QtWidgets.QWidget()
+        self.addCleanup(other.deleteLater)
+        self.addCleanup(other.close)
+        other.setGeometry(self.window.geometry())
+        other.show()
+        other.raise_()
+        other.activateWindow()
+        self.app.processEvents()
+        hwnd = settings
+        while hwnd and hwnd != int(other.winId()):
+            hwnd = user32.GetWindow(hwnd, 3)  # GW_HWNDPREV
+        self.assertEqual(hwnd, int(other.winId()))
 
     def test_remote_mode_dropdown_applies_and_saves_choice(self):
         self.click(self.window._buttons["外观"])
